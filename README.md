@@ -2,178 +2,247 @@
 
 *Your topics live in one dock — plug in Claude Code, Cursor, Codex, or OpenCode anytime to continue.*
 
-**TopicDock 是一个零依赖的个人主题记忆底座：你的讨论、结论和进度按「主题」存成 Markdown 账本，换任何 AI Agent 客户端都能接着做。**
+[简体中文](README.zh-CN.md)
 
-在 Claude Code 里聊了一半的方案，换到 Cursor 就得从头解释；在 Codex 里拍板的结论，OpenCode 并不知道。原因是进度被绑在各客户端自己的「会话（Session）」里，而会话换个窗口、换个客户端就断了。
+**TopicDock is a zero-dependency personal topic memory. It saves your discussions, decisions, and progress as Markdown ledgers organized by topic, so you can pick up where you left off in any AI agent client.**
 
-TopicDock 把记忆的单位从「会话」换成你自己拥有的「主题（Topic）」。主题以普通 Markdown 文件保存，由你的 Agent 通过 `td` 命令读写，不属于任何客户端。Claude Code / Cursor / Codex / OpenCode 都能随时挂载同一个主题，读到完整的结论、被排除的方案、待决问题和当前断点，然后接着干。引擎只用 Python ≥ 3.9 标准库，没有第三方依赖；唯一的可执行文件是单文件 `scripts/topicdock.py`（别名 `td`）。
+## Why TopicDock
 
-## 核心概念
+Say you are halfway through a design in Claude Code and switch to Cursor. You have to explain everything again. Or you settle a decision in Codex, and OpenCode has never heard of it. Your progress is locked inside each client's own "session" (one conversation window), and a session ends when you change windows or clients.
 
-- **正交双轨账本（`[C/R/Q]` + `[A]`）**：认知与定论轨记录已拍板结论 `[C]`、已排除或被推翻的方案 `[R]`、待决问题 `[Q]`；行动与进展轨记录会话级阶段行动 `[A]`（`[ ]` 待办 / `[~]` 进行中断点 / `[x]` 已完成）。没有任何生命周期状态机，主题只要没删除，就永远平权、随时可续、随时可推翻。
-- **双层 Markdown 账本 + 派生图库**：`topics/<topic-id>.md` 是当前态的单页全景（行尾自动附带 ≤ 20 字符的演进短标，如 `(H001→H003)`）；`hops/hop-NNN.md` 保存每一跳（hop，一次保存产生的增量）的证据块与快照；`topicdock.db`（SQLite WAL）只是派生索引，提供毫秒级检索、DAG 引用计数和回滚栈，丢了可以从 Markdown 100% 冷重建。
-- **向上冒泡就近寻址**：从当前工作目录逐级向父目录找 `.topicdock/`（或 `.agents/topicdock.json`），先找到哪一级就用哪一级；都没有就回退到全局默认库 `~/.topicdock/`；仍然没有则返回 `UNINITIALIZED_STORE`，引导建库。
-- **锚点凭证行**：每次写入后，主 Agent 在回复末尾回显 `⚓ TopicDock: <topic-id> (<head_hop>@<base_sha前6位>)`。同一会话未压缩时不用重复查库；长会话发生上下文压缩（Compaction，旧对话被裁剪）后，凭这一行重调 `td use <id>` 即可恢复完整上下文。
+TopicDock changes the unit of memory from the client-bound **session** to a **topic** that you own. A topic is stored as plain Markdown files (`topics/<topic-id>.md` plus `hops/hop-NNN.md`) and is read and written by your agent through the `td` command, so it belongs to no client. Claude Code, Cursor, Codex, or OpenCode can mount the same topic at any time. The agent then sees the full set of conclusions, rejected options, open questions, and the current breakpoint, and keeps going.
 
-## 三支柱工作流（Read / Trace / Write）
+The engine uses only the Python ≥ 3.9 standard library, with no third-party dependencies. Its only executable is the single file `scripts/topicdock.py` (alias `td`).
 
-`SKILL.md` 里的 3 行常驻守则（`install.py` 会把它们注入客户端的 `CLAUDE.md` / `AGENTS.md`；`/topicdock` 命令模板同样指向这套三支柱工作流）：
+## Highlights & Core Concepts
 
-- **TopicDock 调取（Read）**：仅在会话开启首个实质话题、用户点名（`继续 <id|序号>` / `/topicdock`）或中途切入**未挂载的新话题**时，加载 `topicdock` Skill 调用 `td use` 或拆解关键词调用 `td match`（`td match` 含 `--recent` 定位到目标 `topic_id` 后，必须同轮紧接着调一次 `td use <topic_id>` 获取完整 `base_sha` 完成正式挂载）；已挂载主题在同会话同角色后续轮次直接对话，**0 次重复查库与读取**（若发生上下文压缩 Compaction 丢失正文，或同会话切换了 Agent 角色，凭上一条消息末尾的 `⚓ TopicDock: <id> (<head_hop>@<sha6>)` 重调一次 `td use <id>` 刷新完整凭证）。
-- **TopicDock 追根（Trace）**：凡 ① 用户质疑、推翻或深挖某条已挂载结论 `[C]`、排除项 `[R]`、待决 `[Q]` 或行动 `[A]`（含已折叠/已推翻/已合流项）；② 跨会话/跨角色接手未决 `[Q]` 或断点 `[~][A]` 需读取前序跳的多行 `推导与权衡` 与 `核心证据`；③ 基于既有 `[C]/[R]` 继续深化设计或编码而顶层单行摘要不足以确认边界细节时，必须先调用 `td trace <topic_id> <item_id>` 全量拉取底层 `hop-NNN.md` 历次证据块，严禁仅凭顶层一句话摘要臆测。
-- **TopicDock 沉淀（Write）**：仅由**顶层主 Agent**（严禁 Subagent 调用，且禁止用户手改 Markdown 文件）在触达 4 类自然收敛节点——① 达成/推翻 `[C]/[R]` 定论；② 浮现需用户确认或需下一会话/下一阶段/另一角色拍板的未决问题 `[Q]`；③ `[A]` 阶段完成 `[x]` 或停在自然交接断点 `[~]`；④ 话题切换或收尾——时**当轮回复前立即调用 `td save`**（严禁先口头询问“是否交接/保存”再等下一轮；同会话同 `actor` 后续增量默认传 `--amend` 原地更新当前跳，跨会话或切换 `actor` 不传 `--amend` 自动新建下一跳）；并在回复末尾回显一行 `⚓ TopicDock: <topic-id> (<head_hop>@<base_sha前6位>)`。
+- **Orthogonal dual-track ledger (`[C/R/Q]` + `[A]`).** The *knowledge & conclusions* track holds confirmed conclusions `[C]`, rejected or overturned options `[R]`, and open questions `[Q]`. The *session actions* track holds stage-level actions `[A]`, each marked `[ ]` to do, `[~]` in progress (a breakpoint), or `[x]` done. There is no lifecycle state machine. As long as a topic is not deleted, it stays active, resumable, and open to revision.
+- **Two-layer Markdown ledger + derived graph index.**
+  - `topics/<topic-id>.md` is the current-state, single-page panorama. Each line ends with an automatic evolution tag of at most 20 characters, such as `(H001→H003)`.
+  - `hops/hop-NNN.md` stores each hop (one saved increment) with its rich evidence blocks and header snapshot.
+  - `topicdock.db` (SQLite in WAL [write-ahead logging] mode) is only a derived index. It gives millisecond lookup, DAG [directed acyclic graph] reference counting, and the undo stack. If it is lost, it can be rebuilt 100% from the Markdown.
+- **Upward store resolution.** From the current working directory, `td` walks up parent directories looking for `.topicdock/` (or the pointer file `.agents/topicdock.json`) and uses the nearest match. If none is found, it falls back to the global store `~/.topicdock/`. If that does not exist either, it returns `UNINITIALIZED_STORE` (exit code 3) to guide you through creating a store.
+- **Anchor credential line (`⚓`).** After every `td save` (or `td merge`), the agent echoes `⚓ TopicDock: <topic-id> (<head_hop>@<first-6-chars-of-base_sha>)` at the end of its reply. While the context is intact, the session needs no repeated database reads. If a long session is compacted (older conversation is trimmed away), the agent re-runs `td use <id>` using this line and recovers the full context.
+
+## Three-Pillar Workflow (Read / Trace / Write)
+
+The authoritative workflow specification is [`SKILL.md`](SKILL.md). It defines three habits, which the installer wires into your agent as short resident rules.
+
+**Read (mount a topic).** The agent loads a topic only when it needs one. That happens at the first substantive topic of a session, when you name a topic (with `/topicdock`, or the `继续 <id|序号>` phrase, meaning "continue `<id|index>`"), or when you move mid-session to a topic that is not mounted yet. The agent then either runs `td use` or breaks your request into keywords for `td match`. After `td match` finds the target `topic_id`, the agent immediately runs `td use <topic_id>` in the same turn to get the full `base_sha` and complete the mount. Once a topic is mounted, later turns in the same session and role talk directly, with zero repeated lookups. After context compaction, or when the session switches agent role, the agent re-runs `td use <id>` using the `⚓` line from its previous message.
+
+**Trace (go to the evidence).** The agent runs `td trace <topic_id> <item_id>` before answering in three cases:
+1. You question, overturn, or dig into a mounted item (`[C]`, `[R]`, `[Q]`, or `[A]`, including folded, overturned, or merged items).
+2. A new session or role takes over an open `[Q]` or a `[~]` breakpoint and needs the multi-line reasoning and core evidence from earlier hops.
+3. The agent is building on existing `[C]`/`[R]` conclusions and the one-line summary does not settle an edge case.
+
+The trace pulls the full evidence blocks from the underlying `hop-NNN.md` files. The agent must not guess history from a one-line summary.
+
+**Write (save at natural convergence points).** Only the top-level main agent saves. Subagents never call `td match` or `td save`. The agent saves at four points: a conclusion is reached or overturned, an open question appears that needs a decision from you or a later session or role, an action finishes (`[x]`) or stops at a handoff breakpoint (`[~]`), or the topic changes or wraps up. It saves in the same turn, before replying, and does not ask "should I save?" first. Within the same session and the same `actor`, follow-up increments pass `--amend` to update the current hop in place. Across sessions, or when the `actor` changes, the agent omits `--amend` and a new hop is created automatically. After saving, the reply ends with the `⚓` line. Markdown files are written only by `td`, so do not edit them by hand.
+
+How the pieces connect: `install.py` injects the three resident rules into your workspace's `CLAUDE.md` or `AGENTS.md` (see [Installation](#installation)). The `/topicdock` command template points to this same workflow (see [The /topicdock Command](#the-topicdock-command)).
 
 ```bash
-td match --topic jwt --topic 刷新令牌      # 按关键词检索候选主题（0~100 打分，默认阈值 35）
-td use auth-refactor                        # 挂载：返回账本全文 + head_hop + 完整 base_sha
-td trace auth-refactor C2                   # 追根：C2 的全部历史证据块与去向
-td save --stdin --json --amend < payload.json   # 同会话增量：原地更新当前跳
+td match --topic jwt --topic refresh-token   # find candidate topics by keyword (score 0–100, default threshold 35)
+td use auth-refactor                         # mount: returns the full ledger + head_hop + full base_sha
+td trace auth-refactor C2                    # trace: every evidence block and the fate of C2
+td save --stdin --json --amend < payload.json   # same-session increment: update the current hop in place
 ```
 
-## `/topicdock` 单命令入口
+## The /topicdock Command
 
-安装后（见下文），在客户端直接输入 `/topicdock` 即可挂载/切换主题（单一命令，不用命令族）：
+After installation, type `/topicdock` in your client to mount or switch topics. It is one command, not a command family.
 
-- **带参直通**：`/topicdock <id|序号>` → 直接调 `td use <id|序号>` 挂载目标主题，返回账本正文后按三支柱工作流继续。
-- **无参引导**：`/topicdock` → 调 `td use` 无参引导流：库内 0 个主题时引导你说明课题并新建建档；恰好 1 个时直通挂载；≥ 2 个时展示第 1 页列表——列表行在上，格式 `序号 | 标题 | id | 更新时间`，底部是自然语言操作提示（回复序号挂载 / 回复 `删 <序号>` 先出删除预览、经你显式回复该主题的 topic_id 确认后才真正删除 / 有后续页时可回复「下一页」或「全部」/ 直接给关键词按关键词过滤），提示按列表实际状态收敛。列表只用于选择与删除。
-- 命令模板以 `$ARGUMENTS` 传参：claude / opencode 会把命令后的参数替换进模板；cursor 追加原文，模板以自然语言判断参数，三端均可降级执行。
+- **Direct mount with an argument.** `/topicdock <id|index>` calls `td use <id|index>` to mount that topic. The agent receives the ledger text and continues with the three-pillar workflow.
+- **Guided flow without an argument.** `/topicdock` calls `td use` with no argument, and what you see depends on how many topics the store holds:
+  - **0 topics:** the agent asks what you want to work on, then creates the topic.
+  - **Exactly 1 topic:** it mounts directly.
+  - **2 or more topics:** it shows page 1 as a list, with rows in the format `序号 | 标题 | id | 更新时间` (index | title | id | updated at). Below the list are plain-language prompts that adapt to the list's actual state:
+    - Reply with an index to mount that topic.
+    - Reply `删 <序号>` ("delete `<index>`") to delete. The agent first shows a dry-run preview, and nothing is deleted until you reply with that topic's exact `topic_id`.
+    - Reply "next page" or "all" if there are more pages.
+    - Give a keyword to filter the list.
 
-命令模板安装位置（单一事实源 `scripts/templates/topicdock-command.md`，模板正文 frontmatter 后第一行是固定哨兵 `<!-- topicdock:command-managed -->`）：
+  The list exists only for choosing and deleting.
+- **Argument passing.** The command template receives any text after the command through `$ARGUMENTS`. If it looks like `<id|index>`, the agent runs `td use <id|index>` directly. Otherwise it falls back to the no-argument guided flow above.
 
-| 客户端 | 命令文件 |
+The single source of truth for the command is `scripts/templates/topicdock-command.md`. The line after its YAML frontmatter (the metadata header at the top of the file) is the fixed sentinel `<!-- topicdock:command-managed -->`. Installed copies live here:
+
+| Client | Command file |
 |---|---|
-| claude | `~/.claude/commands/topicdock.md` |
-| opencode | `~/.config/opencode/commands/topicdock.md` |
-| cursor | `~/.cursor/commands/topicdock.md` |
+| `claude` | `~/.claude/commands/topicdock.md` |
+| `opencode` | `~/.config/opencode/commands/topicdock.md` |
+| `cursor` | `~/.cursor/commands/topicdock.md` |
 
-codex 不安装命令模板：官方 custom prompts（自定义 slash 命令）已废弃（"Deprecated. Use skills for reusable prompts"），可复用提示改由 Agent Skills 承载，故 codex 只需技能目录 + AGENTS.md 守则块。
+A file with the same name that contains the sentinel is managed by TopicDock. Reinstalling upgrades it and uninstalling removes it. A file without the sentinel is a foreign file. The installer warns and skips it, so it is never silently overwritten, and uninstall leaves it alone.
 
-同名文件含该哨兵 → 属 TopicDock 管理（重装覆盖升级、卸载删除）；不含 → 外来文件，安装时提示跳过、**绝不静默覆盖**，卸载也不动。
+`codex` does not get a command template, because Codex has deprecated custom prompts (custom slash commands) in favor of Agent Skills. Codex therefore uses the skill directory plus the rule block in `<cwd>/AGENTS.md`.
 
-## 快速上手
+## Installation
 
-**环境要求**：Python ≥ 3.9，仅标准库，无需 `pip install` 任何东西。
+**Requirements:** Python ≥ 3.9 and nothing else. It uses only the standard library, so there is no `pip install`.
 
-**安装**（终端直接执行，或在 AI Agent 聊天里粘贴发送）：
+**One-line install.** Run it in a terminal, or paste it into an AI agent chat:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Arrowyi/topicdock/main/scripts/install.sh | bash
 ```
 
-- 想先审查脚本再执行：`curl -fsSL <同上 URL> | less`（纯文本，无压缩无混淆）。
-- 在 AI Agent（Claude Code / Cursor / OpenCode / Codex）聊天里，把上面这条命令原样粘贴发送即可，Agent 会执行它完成安装。
-- 可选参数：`... | bash -s -- --client cursor`（只装/升级指定客户端；不带参数时自动升级本机已装客户端，一个都没装过时会打印四客户端示例命令并以退出码 2 结束，请带 `--client` 重跑）。
-- 安装会按你的本机环境，自动把常驻唤醒守则块注入**当前项目根**的 `AGENTS.md`（claude 为 `CLAUDE.md`）——注入内容含你本机的引擎调用路径，幂等可重入；卸载时按其余已装客户端探测式保留或移除。
+- To read the script before running it, pipe it to a pager instead: `curl -fsSL https://raw.githubusercontent.com/Arrowyi/topicdock/main/scripts/install.sh | less`. It is plain text, not compressed or obfuscated.
+- In an AI agent chat (Claude Code, Cursor, OpenCode, Codex), paste the command as-is. The agent runs it and completes the install.
+- To install or upgrade a specific client, add the optional flag: `... | bash -s -- --client cursor`. With no arguments, the script upgrades the clients already installed on your machine. If none has ever been installed, it prints example commands for all four clients and exits with code 2. Re-run it with `--client`.
+- The install injects a resident wake-up rule block into `<cwd>/AGENTS.md` in your **current working directory** (`<cwd>/CLAUDE.md` for `claude`). Run the installer from your project root so the rules land in your project's root `AGENTS.md` / `CLAUDE.md`. The block includes the engine call path for your machine, and injection is idempotent, so re-running it is safe. On uninstall, the block is kept or removed depending on whether other installed clients still need it.
 
-**从源码安装**（克隆仓库后运行；`scripts/topicdock.py` 是构建产物，缺失时 `install.py` 会先自动调用 `scripts/build.py` 生成）：
+**Install from source.** Clone the repository and run:
 
 ```bash
 python3 scripts/install.py --client claude|opencode|cursor|codex|all [--dest <dir>] [--uninstall]
 ```
 
-它会把 `SKILL.md`、`references/` 和 `scripts/topicdock.py` 复制到对应客户端的技能目录，向 `<cwd>/CLAUDE.md`（claude）或 `<cwd>/AGENTS.md`（opencode / cursor / codex）幂等注入常驻唤醒守则块，并把 `/topicdock` 命令模板安装到上表位置（`--dest <dir>` 同时把命令模板根重定向到 `<dest>/<client>/commands/`），再在 `~/.local/bin/td` 建立指向已安装引擎的符号链接（该目录需在 `PATH` 中；不可写时会打印 `alias` 提示）。`--uninstall` 反向清理：技能目录、命令模板（仅删含哨兵的文件）、守则块、符号链接，记忆文件里守则块以外的内容保留。
+`install.py` does the following:
 
-`td` 链接依赖 `PATH` 中的 `python3` ≥ 3.9；不满足时请以完整命令直接调用引擎：`python3 <技能目录>/scripts/topicdock.py <子命令>`。旧版 cursor 曾把技能装到项目级 `<cwd>/.agents/skills/topicdock`、命令装到 `<cwd>/.cursor/commands/`；这些旧产物不迁移、不自动删除，不再使用 codex 的用户可手动删除该目录。
+1. Copies `SKILL.md`, `references/`, and `scripts/topicdock.py` into the client's skill directory.
+2. Idempotently injects the resident wake-up rule block into `<cwd>/CLAUDE.md` (`claude`) or `<cwd>/AGENTS.md` (`opencode` / `cursor` / `codex`).
+3. Installs the `/topicdock` command template (see the table below). `--dest <dir>` installs somewhere other than the default client locations, redirects command templates to `<dest>/<client>/commands/`, and skips creating the global store.
+4. Creates a symlink at `~/.local/bin/td` pointing to the installed engine. That directory must be on your `PATH`. If it is not writable, the installer prints an `alias` suggestion instead.
+5. Unless `--dest` is set, creates or confirms the global store `~/.topicdock/` at the end (idempotent).
 
-TopicDock 一期面向 macOS / Linux（bash 脚本）；Windows 用户请经 WSL 使用一键安装，或走上方「从源码安装」。
+`--uninstall` reverses all of this: the skill directory, the command templates (only files carrying the sentinel), the rule block, and the symlink. Anything in your memory files outside the rule block is preserved. Uninstalling never deletes your topic database.
 
-各客户端技能落位（`--client` 取值同名）：
+Where each client's skill and command template go (the `--client` values match the first column):
 
-| 客户端 | 技能目录 | 命令模板 |
+| Client | Skill directory | Command template |
 |---|---|---|
-| claude | `~/.claude/skills/topicdock` | `~/.claude/commands/topicdock.md` |
-| opencode | `~/.config/opencode/skills/topicdock` | `~/.config/opencode/commands/topicdock.md` |
-| cursor | `~/.cursor/skills/topicdock` | `~/.cursor/commands/topicdock.md` |
-| codex | `<cwd>/.agents/skills/topicdock` | 无（官方已弃用 custom prompts） |
+| `claude` | `~/.claude/skills/topicdock` | `~/.claude/commands/topicdock.md` |
+| `opencode` | `~/.config/opencode/skills/topicdock` | `~/.config/opencode/commands/topicdock.md` |
+| `cursor` | `~/.cursor/skills/topicdock` | `~/.cursor/commands/topicdock.md` |
+| `codex` | `<cwd>/.agents/skills/topicdock` | none (Codex custom prompts are deprecated) |
 
-无 `--dest` 时，安装末尾会自动建立/确认全局库 `~/.topicdock/`（幂等）；卸载绝不删除数据库。codex 技能目录是唯一的项目级共享根 `<cwd>/.agents/skills/topicdock`；`<cwd>/AGENTS.md` 守则块由 opencode / cursor / codex 共注，卸载任一方时按其余客户端技能目录**探测式**保留或移除（`<cwd>/CLAUDE.md` 的块仅属 claude）。
+Notes:
 
-**最小闭环：建库 → 保存 → 挂载**
+- The Codex skill directory is the only project-level shared root, `<cwd>/.agents/skills/topicdock`. The rule block in `<cwd>/AGENTS.md` is shared by `opencode`, `cursor`, and `codex`. Uninstalling any one of them checks the other clients' skill directories and keeps or removes the block accordingly. The block in `<cwd>/CLAUDE.md` belongs to `claude` alone.
+- The `td` symlink runs the `python3` found on your `PATH`, which must be ≥ 3.9. If your default `python3` is older than 3.9, or `~/.local/bin` is not on your `PATH`, invoke the engine with a specific Python ≥ 3.9 interpreter, for example `python3.11 <skill-dir>/scripts/topicdock.py <subcommand>`.
+- TopicDock v1 targets macOS and Linux (the one-line installer is a bash script). On Windows, use the one-line install through WSL (Windows Subsystem for Linux), or install from source.
+
+## Quickstart
+
+A minimal loop: create a store, save a first topic, then mount and trace it.
 
 ```bash
-# 1) 初始化存储库（global = ~/.topicdock/，local = <cwd>/.topicdock/）
+# 1) Initialize a store (global = ~/.topicdock/, local = <cwd>/.topicdock/). Safe to repeat.
 td init --scope global
 
-# 2) 首次保存建档：base_hop 为 null 即新建主题，本例创建 C1 与 A1
+# 2) First save creates the topic: base_hop null means "new topic". This one creates C1 and A1.
 td save --stdin --json <<'EOF'
 {
   "topic_id": "auth-refactor",
-  "title": "认证模块无状态 JWT 改造",
+  "title": "Stateless JWT for the auth module",
   "base_hop": null,
   "session_id": "ses-01",
-  "actor": "architect",
-  "summary": "敲定无状态 JWT 方案，开始实现刷新端点",
-  "next_focus": "完成 Refresh Token 旋转逻辑",
+  "actor": "opencode/architect",
+  "summary": "Settled on stateless JWT; started on the refresh endpoint",
+  "next_focus": "Finish the refresh-token rotation logic",
   "mutations": [
-    {"op": "create", "track": "C", "statement": "采用无状态 JWT + Refresh Token 旋转",
-     "evidence_status": "inferred", "basis": "网关无共享会话存储"},
-    {"op": "create", "track": "A", "state": "~", "statement": "实现 /refresh 端点",
-     "basis": "路由已完成，待写旋转逻辑"}
+    {"op": "create", "track": "C", "statement": "Use stateless JWT with refresh-token rotation",
+     "evidence_status": "inferred", "basis": "The gateway has no shared session store"},
+    {"op": "create", "track": "A", "state": "~", "statement": "Implement the /refresh endpoint",
+     "basis": "Routing is done; rotation logic is still to write"}
   ]
 }
 EOF
-# 返回 head_hop 为 H001 的 JSON，其 echo 字段即回显行：
+# The JSON result has head_hop H001; its echo field is the anchor line:
 # ⚓ TopicDock: auth-refactor (H001@<sha6> 新建 | +1[C] +1[A])
 
-# 3) 之后在任意客户端、任意会话：挂载并追根
+# 3) Later, from any client and any session: mount, then trace
 td use auth-refactor
 td trace auth-refactor C1
 ```
 
-## 11 个子命令速查
+If the store does not exist yet, every command except `td init` exits with code 3 (`UNINITIALIZED_STORE`). When you install with the one-line installer, the global store is already created for you, and `td init` is idempotent anyway.
 
-| 命令 | 参数签名 | 说明 |
+For your next save on this topic, set `base_hop` to `H001` and `base_sha` to the full `base_sha` returned by `td use` or `td save`.
+
+### The `⚓` echo line
+
+The `echo` field returned by `td save` and `td merge` is the authoritative source of the anchor line. It has three formats:
+
+- **New topic:** `⚓ TopicDock: <id> (<head_hop>@<sha6> 新建 | +1[C] +1[R] +1[A])`. The `+n[track]` segments count the items created in each track.
+- **Sealed-hop fallback:** `⚓ TopicDock: <id> (<old> 已封板 → 自动新建 <head_hop>@<sha6> | +1[C] +1[A])`. This appears when the previous head hop was sealed and the save automatically started a new hop.
+- **Regular / amend / merge:** `⚓ TopicDock: <id> (<head_hop>@<sha6> | …)`. An `--amend` save includes an ` amend` segment. When nothing new was created, the line shows `无新增条目` ("no new items").
+
+*Note: Engine output strings remain untranslated in v1 (prompt localization is tracked on a separate track).*
+
+## 11 Subcommands & Exit Codes
+
+| Command | Argument signature | What it does |
 |---|---|---|
-| `td init` | `--scope global\|local [--path <dir>]` | 初始化存储库，幂等 |
-| `td use` | `[<topic_id\|index>]` | 挂载主题，返回账本全文 + `(head_hop, base_sha)`；无参时按库内主题数引导 |
-| `td match` | `[--topic <kw> [--topic <kw2> …]] [--threshold 35] [--recent]` | 关键词打分召回（同分按 `updated_at` 倒序、`topic_id` 升序）；`--recent` 免 `--topic` 直接取最近 ≤ 5 个 |
-| `td save` | `--stdin \| --json-file <path> [--amend] [--fork-as <new_id>] [--force-merge]` | 唯一权威写入入口，带乐观并发校验；载荷可选 `model`（缺省不落键） |
-| `td merge` | `<src_topic_id> <dst_topic_id> [--summary "..."] [--session-id] [--actor] [--model] [--next-focus]` | 跨主题合流：src 条目并入 dst，trace 不断链（`--actor`/`--model` 默认 `""`） |
-| `td trace` | `<topic_id> <item_id>` | 拉取条目的全部历史证据块，已推翻/已折叠/已合流项同样可查 |
-| `td list` | `[--page P] [--page-size 10] [--all] [--filter "<kw>"]` | 分页列出主题，按 `updated_at` 倒序 |
-| `td view` | `<topic_id\|index> [--history]` | 只读查看；`--history` 输出跳摘要链（含 `model` 时一并输出） |
-| `td delete` | `<expr> [--dry-run] [--yes]` | 默认只预览；`--yes` 只接受显式 topic_id 列表 |
-| `td undo` | `[--force]` | 回滚最近 3 次写操作之一 |
-| `td doctor` | `[--rebuild]` | 七步自愈巡检；`--rebuild` 强制从 Markdown 冷重建图库 |
+| `td init` | `--scope global\|local [--path <dir>]` | Initialize a store. Idempotent. |
+| `td use` | `[<topic_id\|index>]` | Mount a topic. Returns the full ledger and `(head_hop, base_sha)`. With no argument, it guides you based on how many topics exist. |
+| `td match` | `[--topic <kw> [--topic <kw2> …]] [--threshold 35] [--recent]` | Keyword scoring and recall. Ties are ordered by `updated_at` descending, then `topic_id` ascending. `--recent` skips `--topic` and returns the most recent topics (up to 5). |
+| `td save` | `--stdin \| --json-file <path> [--amend] [--fork-as <new_id>] [--force-merge]` | The one authoritative write entry, with optimistic concurrency checking. The payload accepts an optional `model` string (omitted on new hops when blank; preserved on `--amend` when omitted). |
+| `td merge` | `<src_topic_id> <dst_topic_id> [--summary "..."] [--session-id] [--actor] [--model] [--next-focus]` | Cross-topic merge. Items from `src` are merged into `dst` and trace links stay unbroken. `--actor` and `--model` default to `""`. |
+| `td trace` | `<topic_id> <item_id>` | Pull every historical evidence block of an item. Overturned, folded, and merged items can still be traced. |
+| `td list` | `[--page P] [--page-size 10] [--all] [--filter "<kw>"]` | List topics in pages, ordered by `updated_at` descending. |
+| `td view` | `<topic_id\|index> [--history]` | Read-only view. `--history` prints the chain of hop summaries (including `model` when present). |
+| `td delete` | `<expr> [--dry-run] [--yes]` | Preview by default. `--yes` accepts only an explicit `topic_id` list. |
+| `td undo` | `[--force]` | Roll back the most recent entry of a 3-deep undo stack. |
+| `td doctor` | `[--rebuild]` | Run the seven-step self-healing inspection. `--rebuild` forces a cold rebuild of the graph index from Markdown. |
 
-全局参数 `--json`（输出缩进 JSON）、`--store-dir <dir>`（显式指定库目录）、`--workspace <dir>`（覆盖寻址起点）可放在子命令前或后。退出码 `0~7`：`0` OK、`1` 未预期错误、`2` 用法错误、`3` `UNINITIALIZED_STORE`、`4` `STALE_BASE`、`5` 主题/条目不存在、`6` `UNSUPPORTED_SCHEMA_VERSION`、`7` `INVALID_INPUT`。完整的 JSON 输入/输出契约和状态转移矩阵见 [`references/cli-contract.md`](references/cli-contract.md)。跨库 `export / import` 属二期规划，一期不提供。
+**Global flags** can go before or after the subcommand:
 
-## 可靠性与防呆保障
+- `--json`: indented JSON output.
+- `--store-dir <dir>`: use this store directory explicitly.
+- `--workspace <dir>`: override the starting point of store resolution (default: the current directory).
 
-- **`(base_hop, base_sha)` 双因子乐观并发校验（CAS，先比对再写入）**：多窗口并发推进或原地 `--amend` 时不会静默覆盖。基准失步时 `td save` 返回 `STALE_BASE`（退出码 4）：与新增内容无冲突的可换新 base 重发自动吸收；有冲突的由用户二选一，`--fork-as` 分叉成新主题，或 `--force-merge` 以当前 head 为基覆盖（响应会列出被覆盖条目）。
-- **七步启动自愈（`td doctor`）**：每条命令启动时，都会在跨平台文件锁下自动巡检。账本只许通过 `td` 修改，手改一律视为文件破坏：能用 `topicdock.db + hops/` 重放还原的（含标题与关联文件快照）自动覆写修复；无法修复或改了 `topic_id` 的损坏主题直接级联清理，不会拖累其他主题。
-- **灾备与 100% 冷重建**：`topicdock.db` 丢失或损坏时自动重建（也可手动 `td doctor --rebuild`），结果与增量维护的结果一致。`hop-NNN.md` 被误删时断链跳过、不会崩溃；外部关联文件被移动或缺失时，先按同名探测，找不到则追加告警，并在下次保存或巡检时摘除死链。删除主题时实时校验 DAG 的可达引用计数，只物理删除 `live_refs == 0` 的独占分片。
-- **定长 3 步防呆回滚（`td undo`）**：保留最近 3 次 `save / amend / merge / delete` 的快照。回滚前校验文件哈希，并确认没有新增的存活子跳引用，再原子还原。条目编号的水位线只增不减，被撤回的编号不会复用，不会串号。
+**Exit codes `0–7`:**
 
-## 更多文档与仓库结构
+| Code | Status | Meaning |
+|---|---|---|
+| 0 | `OK` | Success (including an empty undo stack and an all-`ok` doctor run). |
+| 1 | `ERROR` | Unexpected error, reported as `{status, error}` without a traceback. |
+| 2 | — (no JSON) | Usage error from argparse, such as a missing required argument or an unknown subcommand. |
+| 3 | `UNINITIALIZED_STORE` | No store was found by upward search or in the global location. |
+| 4 | `STALE_BASE` | Concurrency check failed because another window moved the topic forward. Never silently applied. |
+| 5 | `TOPIC_NOT_FOUND` / `ITEM_NOT_FOUND` | The topic or item does not exist, including a selector that fails to resolve. |
+| 6 | `UNSUPPORTED_SCHEMA_VERSION` | The data's `schema_version` is newer than this engine supports (checked before any write or delete). |
+| 7 | `INVALID_INPUT` | Input error: invalid or non-JSON payload, `--fork-as` combined with `--amend`/`--force-merge`, an invalid delete expression, or a blocked rollback (`UNDO_BLOCKED`). |
 
-- [`SKILL.md`](SKILL.md)：常驻 3 行唤醒守则与主 Agent 完整工作流契约
-- [`references/markdown-spec.md`](references/markdown-spec.md)：`topics/<id>.md` 与 `hops/hop-NNN.md` 的精确语法、转义规则与冷重建不变量
-- [`references/cli-contract.md`](references/cli-contract.md)：11 个子命令参数、JSON 输入/输出 Schema、退出码（`0–7`）与 `STALE_BASE` 吸收协议
-- [`AGENTS.md`](AGENTS.md)：仓库六层分片构建规范与改动→验证测试映射表
+Full JSON input and output schemas and the operation matrix are in [`references/cli-contract.md`](references/cli-contract.md). Cross-store `export / import` is planned for v2 and is not provided in v1.
 
-```text
-TopicDock/
-├── SKILL.md                    # Skill 入口：常驻守则 + 工作流契约
-├── AGENTS.md                   # 开发规范与改动→验证映射表
-├── references/
-│   ├── markdown-spec.md        # 账本 Markdown 语法规范
-│   └── cli-contract.md         # CLI 与 JSON 契约
-├── scripts/
-│   ├── topicdock.py            # 单文件引擎（构建产物，不手改）
-│   ├── layers/                 # 源码分片 L1→L6，按文件名序拼接
-│   ├── templates/
-│   │   └── topicdock-command.md  # /topicdock 命令模板（单一事实源）
-│   ├── build.py                # 分片 → topicdock.py 纯拼接
-│   └── install.py              # 跨客户端 Skill + 命令模板安装/卸载与守则注入
-└── tests/                      # 标准库 unittest
-```
+## Reliability & Safeguards
 
-改代码请改 `scripts/layers/` 下的分片，再构建并跑全量测试（当前 272 个测试全绿）：
+- **Dual-factor optimistic concurrency control (CAS: compare first, then write) on `(base_hop, base_sha)`.** Concurrent windows, or an in-place `--amend`, never silently overwrite each other. When your base is out of date, `td save` returns `STALE_BASE` (exit code 4) with the current head, the changed items, and `auto_absorbable`:
+  - `auto_absorbable: true` means your payload does not touch anything that changed. Resend it with `base_hop` set to `current_head` and `base_sha` set to `current_sha`, and it is absorbed.
+  - `auto_absorbable: false` means there is a conflict, and you choose between two options. `--fork-as <new_id>` forks a new topic from the state at your base, with no overwrite risk. `--force-merge` replays on top of the current head, where the last write wins and the response lists the overwritten items.
+- **Seven-step startup self-healing (`td doctor`).** Every command starts with an automatic inspection under a cross-platform file lock. Ledger files may be changed only through `td`, so a manual edit is treated as corruption:
+  - If the topic can be restored by replaying from `topicdock.db` + `hops/`, it is rewritten automatically. This includes the title and the linked-file snapshot.
+  - If it cannot be repaired, or its `topic_id` was altered, the damaged topic is cascade-cleaned (removed together with the hop files that depend on it). Other topics are never blocked by it.
+- **Disaster recovery and 100% cold rebuild.**
+  - A missing or corrupt `topicdock.db` is rebuilt automatically. You can also force it with `td doctor --rebuild`.
+  - A deleted `hop-NNN.md` is skipped as a broken link instead of crashing.
+  - When an external linked file moves or goes missing, TopicDock first looks for a file with the same name. If none is found, it adds a warning and drops the dead link on the next save or inspection.
+  - Deleting a topic checks the live DAG reference count and physically removes only the hops with `live_refs == 0`.
+- **Fixed-depth 3-step rollback (`td undo`).** The engine keeps snapshots of the last 3 `save` / `amend` / `merge` / `delete` operations (`LIMIT 3`). Before restoring, it verifies file hashes. `--force` relaxes only the disk-hash mismatch check. It also always checks that no live child hop still references the hop being removed. If one does, the undo is refused with `INVALID_INPUT` (exit code 7) and an `UNDO_BLOCKED` detail. Item and hop sequence numbers only move forward, so a retracted ID is never reused. If an undo was interrupted, a leftover `.topicdock-undo-pending.json` file makes the next undo fail with `INVALID_INPUT` until you delete that file. One documented corner case: if the database is also lost after an undo and then cold-rebuilt, a retracted number could be reused (see the known boundaries in [`references/markdown-spec.md`](references/markdown-spec.md)).
 
-```bash
-/opt/homebrew/bin/python3.13 scripts/build.py
-/opt/homebrew/bin/python3.13 -m unittest discover -s tests -v   # 必须在仓库根目录运行
-```
+## FAQ
 
-以上解释器路径是维护者本机的写法，其他环境换成任意 Python ≥ 3.9 即可。
+**Can I edit the Markdown files by hand?**
+No. `topics/<id>.md` and `hops/hop-NNN.md` are written only by `td`, and any manual edit counts as file corruption. TopicDock tries to restore the topic by replaying from `topicdock.db` and `hops/`. If that is impossible, or you changed the `topic_id`, the topic is removed. If you did edit something, run `td doctor` right away.
+
+**What happens if two agent windows save to the same topic at the same time?**
+Neither overwrites the other. The window with the out-of-date base gets `STALE_BASE` (exit code 4). If its changes do not overlap the newer ones, it can resend on the new base and be absorbed. If they overlap, you choose between forking a new topic (`--fork-as`) and overwriting (`--force-merge`). See [Reliability & Safeguards](#reliability--safeguards).
+
+**Will uninstalling delete my topics?**
+No. Uninstall removes only the skill directory, the command templates that carry the sentinel, the injected rule blocks, and the `td` symlink. It never deletes your topic database.
+
+**How do I use TopicDock on Windows?**
+TopicDock v1 targets macOS and Linux. On Windows, run the one-line installer inside WSL, or install from source with `python3 scripts/install.py` (Python ≥ 3.9).
+
+**Can I version-control or back up my `.topicdock/` store?**
+The store is made of ordinary files, so any backup or sync tool works on it. `topicdock.db` is derived and can be rebuilt from the Markdown with `td doctor --rebuild`. The `topics/` and `hops/` files are the source of truth, so back up the whole store directory. Linked artifacts (the `artifacts` entries) are path references to external documents, such as design or plan files, not copies of their contents inside the store, so a store backup holds the references and not those documents. Keep the rule in mind: only `td` should write to the store, so a merge that mixes files from two copies is, from TopicDock's point of view, a manual edit. Cross-store `export / import` is planned for v2.
+
+## Documentation
+
+- [`SKILL.md`](SKILL.md): the resident rules and the complete workflow contract for the main agent
+- [`references/markdown-spec.md`](references/markdown-spec.md): exact syntax of `topics/<id>.md` and `hops/hop-NNN.md`, escaping rules, and cold-rebuild invariants
+- [`references/cli-contract.md`](references/cli-contract.md): the 11 subcommands, JSON input/output schemas, exit codes `0–7`, and the `STALE_BASE` absorption protocol
+- [`README.zh-CN.md`](README.zh-CN.md): this page in Simplified Chinese
