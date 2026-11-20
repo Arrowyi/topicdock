@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 import sys
+import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path

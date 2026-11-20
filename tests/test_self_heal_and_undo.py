@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from pathlib import Path
+from unittest import mock
 
 from tests.util import (
     ALPHA_TITLE,
@@ -1216,9 +1218,11 @@ class TestUndoStackSemantics(TopicDockTestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("checks", report)
-        # 健康库：除 meta_json ok 外零修复
+        # 健康库：除 meta_json 与 doctor 双巡检（须 ok）外零修复
         for check in report["checks"]:
             if check["name"] == "meta_json":
+                self.assertEqual(check["status"], "ok")
+            elif check["name"] in ("published_ledger", "hop_oid_drift"):
                 self.assertEqual(check["status"], "ok")
             else:
                 self.fail(f"健康库不应有修复项: {check}")
@@ -1476,3 +1480,605 @@ class TestUndoRecoveryGuards(TopicDockTestCase):
         md = (Path(store) / "topics" / "alpha.md").read_text(encoding="utf-8")
         self.assertIn("- [alpha:C1] C1", md)
         self.assertNotIn("C2", md)
+
+
+class TestPublishedLedgerGuards(TopicDockTestCase):
+    """D8：封板台账 undo 恒拦截 / 损坏失败关闭 / doctor 双巡检。"""
+
+    def _live(self):
+        store = make_store()
+        code, data = run_save(store, {
+            "topic_id": "alpha", "title": "alpha 主题标题", "base_hop": None,
+            "base_sha": None, "session_id": "ses-1", "actor": "t",
+            "summary": "首轮", "mutations": [
+                {"op": "create", "track": "C", "statement": "结论一",
+                 "evidence_status": "verified", "basis": "依据一"},
+            ]}, self.tmp_root)
+        self.assertEqual(code, 0)
+        return store, data
+
+    def _oid(self, store, hop_id):
+        path = Path(store) / "hops" / topicdock.hop_file_name(hop_id)
+        return topicdock.compute_hop_oid(
+            topicdock.parse_hop_md(path.read_text(encoding="utf-8"))
+        )
+
+    def _seal(self, store, *oids):
+        ctx = _ctx(store)
+        with ctx.exclusive_lock():
+            topicdock.mark_published_oids(ctx, list(oids))
+
+    def _checks(self, store):
+        code, report = run_cli_json(
+            ["doctor", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        return {check["name"]: check for check in report["checks"]}
+
+    def test_undo_sealed_blocked_even_force_then_unsealed_ok(self):
+        store, _data = self._live()
+        self._seal(store, self._oid(store, "H001"))
+        for flags in ([], ["--force"]):
+            code, blocked = run_cli_json(
+                ["undo", *flags, "--store-dir", str(store), "--json"]
+            )
+            self.assertEqual(code, 7)
+            self.assertEqual(blocked["status"], "INVALID_INPUT")
+            text = json.dumps(blocked, ensure_ascii=False)
+            self.assertIn("UNDO_BLOCKED", text)
+            self.assertIn("已发布封板跳不可回滚", text)
+        # 拦截发生在 journal 写之前，栈弹出随事务回滚恢复 → 解封后照常回滚
+        (Path(store) / ".topicdock-published.json").unlink()
+        code, undone = run_cli_json(
+            ["undo", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(undone["op_type"], "save")
+
+    def test_corrupt_ledger_fails_closed_for_amend_undo_and_doctor(self):
+        variants = [
+            "{not-json",
+            json.dumps({"v": 2, "published_oids": []}),
+            json.dumps({"v": True, "published_oids": []}),
+            json.dumps({"v": 1, "published_oids": "v1:" + "0" * 64}),
+            json.dumps({"v": 1, "published_oids": [1]}),
+        ]
+        for index, content in enumerate(variants):
+            with self.subTest(variant=index):
+                code, init = run_cli_json([
+                    "init", "--scope", "local", "--path",
+                    str(self.tmp_root / f"ledger-{index}"), "--json",
+                ])
+                self.assertEqual(code, 0)
+                store = Path(init["store_dir"])
+                code, data = run_save(store, {
+                    "topic_id": "alpha", "title": "alpha 主题标题",
+                    "base_hop": None, "base_sha": None, "session_id": "ses-1",
+                    "actor": "t", "summary": "首轮", "mutations": [
+                        {"op": "create", "track": "C", "statement": "结论一",
+                         "evidence_status": "verified", "basis": "依据一"},
+                    ]}, self.tmp_root)
+                self.assertEqual(code, 0)
+                (store / ".topicdock-published.json").write_text(
+                    content, encoding="utf-8"
+                )
+                self.assertEqual(
+                    topicdock.read_published_oids(_ctx(store)), (set(), True)
+                )
+                # 台账损坏 → amend 降级新建
+                code, degraded = run_save(store, {
+                    "topic_id": "alpha", "base_hop": "H001",
+                    "base_sha": data["base_sha"], "session_id": "ses-1",
+                    "mutations": [
+                        {"op": "create", "track": "C", "statement": "降级"}],
+                }, self.tmp_root, "--amend")
+                self.assertEqual(code, 0)
+                self.assertFalse(degraded["amend"])
+                self.assertTrue(degraded["degraded"])
+                self.assertEqual(degraded["head_hop"], "H002")
+                # doctor 报 invalid
+                checks = self._checks(store)
+                self.assertEqual(checks["published_ledger"]["status"], "invalid")
+                # delete 型栈项（无 new_hop）同样恒拦截
+                code, deleted = run_cli_json(
+                    ["delete", "alpha", "--yes", "--store-dir", str(store),
+                     "--json"]
+                )
+                self.assertEqual(code, 0)
+                for flags in ([], ["--force"]):
+                    code, blocked = run_cli_json(
+                        ["undo", *flags, "--store-dir", str(store), "--json"]
+                    )
+                    self.assertEqual(code, 7)
+                    self.assertIn(
+                        "UNDO_BLOCKED", json.dumps(blocked, ensure_ascii=False)
+                    )
+
+    def test_doctor_ledger_missing_and_valid_are_ok(self):
+        store, _data = self._live()
+        checks = self._checks(store)
+        self.assertEqual(checks["published_ledger"]["status"], "ok")
+        self._seal(store, self._oid(store, "H001"))
+        checks = self._checks(store)
+        self.assertEqual(checks["published_ledger"]["status"], "ok")
+        self.assertIn("1", checks["published_ledger"]["detail"])
+
+    def test_hop_oid_drift_reported_without_cascade(self):
+        store, _data = self._live()
+        hop_path = Path(store) / "hops" / "hop-001.md"
+        old_sha = topicdock.file_sha256(hop_path)
+        hop = topicdock.parse_hop_md(hop_path.read_text(encoding="utf-8"))
+        hop.header["hop_oid"] = "v1:" + "0" * 64
+        topicdock.atomic_write_text(hop_path, topicdock.render_hop_md(hop))
+        new_sha = topicdock.file_sha256(hop_path)
+        # 旧客户端 amend 未刷新 hop_oid 的真实面：DB 与顶层 md 同步到新文件
+        md_path = Path(store) / "topics" / "alpha.md"
+        md_text = md_path.read_text(encoding="utf-8")
+        new_md = md_text.replace(
+            f"sha: `{old_sha[:12]}`", f"sha: `{new_sha[:12]}`"
+        )
+        self.assertNotEqual(new_md, md_text)
+        topicdock.atomic_write_text(md_path, new_md)
+        conn = get_or_create_db(_ctx(store))
+        conn.execute(
+            "UPDATE hops SET md_sha256=? WHERE hop_id='H001'", (new_sha,)
+        )
+        conn.execute(
+            "UPDATE topics SET md_sha256=? WHERE topic_id='alpha'",
+            (topicdock.sha256_text(new_md),),
+        )
+        conn.commit()
+        conn.close()
+        # 非破坏性：经自愈后主题仍存活（不判 damaged 级联删）
+        conn, _reports = ensure_store_healthy(_ctx(store))
+        try:
+            row = conn.execute(
+                "SELECT head_hop FROM topics WHERE topic_id='alpha'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        checks = self._checks(store)
+        self.assertEqual(checks["hop_oid_drift"]["status"], "drift")
+        self.assertIn("H001", checks["hop_oid_drift"]["detail"])
+
+    def test_directory_ledger_path_fails_closed(self):
+        """台账路径被目录占用 = 读取失败（非「不存在」）→ 失败关闭。"""
+        store, data = self._live()
+        (Path(store) / ".topicdock-published.json").mkdir()
+        self.assertEqual(
+            topicdock.read_published_oids(_ctx(store)), (set(), True)
+        )
+        code, degraded = run_save(store, {
+            "topic_id": "alpha", "base_hop": "H001",
+            "base_sha": data["base_sha"], "session_id": "ses-1",
+            "mutations": [
+                {"op": "create", "track": "C", "statement": "降级"}],
+        }, self.tmp_root, "--amend")
+        self.assertEqual(code, 0)
+        self.assertFalse(degraded["amend"])
+        self.assertTrue(degraded["degraded"])
+        self.assertEqual(degraded["head_hop"], "H002")
+        checks = self._checks(store)
+        self.assertEqual(checks["published_ledger"]["status"], "invalid")
+        for flags in ([], ["--force"]):
+            code, blocked = run_cli_json(
+                ["undo", *flags, "--store-dir", str(store), "--json"]
+            )
+            self.assertEqual(code, 7)
+            self.assertIn(
+                "UNDO_BLOCKED", json.dumps(blocked, ensure_ascii=False)
+            )
+
+    def test_mark_published_oids_refuses_corrupt_ledger(self):
+        """台账损坏 → 拒绝覆写（字节不变），既有封板记录不被静默遗忘。"""
+        store, data = self._live()
+        ledger = Path(store) / ".topicdock-published.json"
+        ledger.write_text(
+            json.dumps({"v": 2, "published_oids": ["v1:" + "a" * 64]}),
+            encoding="utf-8",
+        )
+        before = ledger.read_bytes()
+        ctx = _ctx(store)
+        with self.assertRaises(topicdock.InvalidInput):
+            with ctx.exclusive_lock():
+                topicdock.mark_published_oids(ctx, ["v1:" + "b" * 64])
+        self.assertEqual(ledger.read_bytes(), before)
+        self.assertEqual(
+            topicdock.read_published_oids(ctx), (set(), True)
+        )
+        # 失败关闭面保持不变：amend 仍降级、undo 仍拦截
+        code, degraded = run_save(store, {
+            "topic_id": "alpha", "base_hop": "H001",
+            "base_sha": data["base_sha"], "session_id": "ses-1",
+            "mutations": [
+                {"op": "create", "track": "C", "statement": "降级"}],
+        }, self.tmp_root, "--amend")
+        self.assertEqual(code, 0)
+        self.assertTrue(degraded["degraded"])
+        code, blocked = run_cli_json(
+            ["undo", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 7)
+        self.assertIn(
+            "UNDO_BLOCKED", json.dumps(blocked, ensure_ascii=False)
+        )
+
+    def test_doctor_rebuild_keeps_published_ledger(self):
+        store, _data = self._live()
+        oid = self._oid(store, "H001")
+        self._seal(store, oid)
+        ledger = Path(store) / ".topicdock-published.json"
+        before = ledger.read_bytes()
+        code, _report = run_cli_json(
+            ["doctor", "--rebuild", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(ledger.read_bytes(), before)
+        self.assertEqual(
+            topicdock.read_published_oids(_ctx(store)), ({oid}, False)
+        )
+
+
+# ===================== M3/D9：版本守卫短读 / 探测连接复用 / match·use 单轮复合 =====================
+
+
+class _CountingReader:
+    """包裹二进制文件对象，累计实际 read 的字节数（断言短读不吞全文件）。"""
+
+    def __init__(self, handle):
+        self._handle = handle
+        self.total = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self._handle.close()
+        return False
+
+    def read(self, size=-1):
+        data = self._handle.read(size)
+        self.total += len(data)
+        return data
+
+    def readline(self, size=-1):
+        data = self._handle.readline(size)
+        self.total += len(data)
+        return data
+
+
+class TestSchemaGuardShortRead(TopicDockTestCase):
+    """D9 短读守卫：frontmatter 界内命中、超上限未闭合不判定、CRLF 跳头仍拦截。"""
+
+    def test_long_frontmatter_high_version_still_rejected(self):
+        store = make_store()
+        ctx = _ctx(store)
+        path = ctx.topics_dir / "big.md"
+        path.write_text(
+            "---\nschema_version: 2\ntopic_id: big\ntitle: "
+            + ("x" * 20000)
+            + "\n---\nbody\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(topicdock.UnsupportedSchemaVersion):
+            topicdock._raise_on_newer_schema(ctx)
+
+    def test_unclosed_oversized_frontmatter_not_read_fully(self):
+        store = make_store()
+        ctx = _ctx(store)
+        path = ctx.topics_dir / "broken.md"
+        payload = b"---\n" + b"schema_version: 2\n" + (b"x" * (80 * 1024))
+        path.write_bytes(payload)
+        real_open = Path.open
+        readers: list[_CountingReader] = []
+
+        def _counting_open(self, *args, **kwargs):
+            reader = _CountingReader(real_open(self, *args, **kwargs))
+            readers.append(reader)
+            return reader
+
+        with mock.patch.object(Path, "open", _counting_open):
+            topicdock._raise_on_newer_schema(ctx)  # 未闭合 → 不判定，不抛
+        self.assertTrue(readers)
+        self.assertLessEqual(readers[0].total, 64 * 1024)
+        self.assertLess(readers[0].total, len(payload))
+
+    def test_cr_only_topic_schema_rejected_via_cli(self):
+        store = make_store()
+        ctx = _ctx(store)
+        text = (
+            "---\nschema_version: 2\ntopic_id: cr-only\ntitle: CR 主题\n"
+            "---\nbody\n"
+        )
+        (ctx.topics_dir / "cr-only.md").write_bytes(
+            text.replace("\n", "\r").encode("utf-8")
+        )
+        code, data = run_cli_json(
+            ["list", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 6)
+        self.assertEqual(data["status"], "UNSUPPORTED_SCHEMA_VERSION")
+
+    def test_cr_only_cross_chunk_boundary_still_rejected(self):
+        store = make_store()
+        ctx = _ctx(store)
+        # 首行 `---\r\n` 后填 8186 字节，使行尾 `\r` 落在第 8192 字节、
+        # `\n` 落在下一 chunk 首字节（跨 chunk 的 CRLF 必须仍算一个行尾）。
+        payload = (
+            b"---\r\n"
+            + (b"x" * (8191 - len(b"---\r\n")))
+            + b"\r\n"
+            + b"schema_version: 2\r\n"
+            + b"---\r\n"
+        )
+        self.assertGreater(len(payload), 8192)
+        (ctx.topics_dir / "boundary.md").write_bytes(payload)
+        with self.assertRaises(topicdock.UnsupportedSchemaVersion):
+            topicdock._raise_on_newer_schema(ctx)
+
+    def test_lf_frontmatter_low_version_unaffected(self):
+        store = make_store()
+        ctx = _ctx(store)
+        (ctx.topics_dir / "ok.md").write_text(
+            "---\nschema_version: 1\ntopic_id: ok\ntitle: ok\n---\n",
+            encoding="utf-8",
+        )
+        topicdock._raise_on_newer_schema(ctx)  # 合法 LF v1：零误判
+
+    def test_crlf_hop_header_high_version_still_rejected(self):
+        store = make_store()
+        ctx = _ctx(store)
+        path, _header = write_hop(store, "H001", "alpha", [], [], title="alpha")
+        text = path.read_text(encoding="utf-8").replace('"v":1', '"v":2')
+        path.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+        with self.assertRaises(topicdock.UnsupportedSchemaVersion):
+            topicdock._raise_on_newer_schema(ctx)
+
+
+class TestProbeConnectionReuse(TopicDockTestCase):
+    """D9：健康库探测连接直接升格；任何异常路径 connect 计数 == close 计数。"""
+
+    def _patch_connect(self):
+        counts = {"connect": 0, "close": 0}
+        real_connect = sqlite3.connect
+
+        class _CountingConnection(sqlite3.Connection):
+            def close(self):
+                counts["close"] += 1
+                return super().close()
+
+        def _fake_connect(*args, **kwargs):
+            counts["connect"] += 1
+            kwargs["factory"] = _CountingConnection
+            return real_connect(*args, **kwargs)
+
+        return counts, mock.patch.object(sqlite3, "connect", _fake_connect)
+
+    def test_healthy_store_connects_once_and_reused_conn_initialized(self):
+        store, _builders = _rich_live_store()
+        ctx = _ctx(store)
+        counts, patch = self._patch_connect()
+        with patch:
+            conn, _reports = ensure_store_healthy(ctx)
+            try:
+                foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+                meta = conn.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+        self.assertEqual(counts["connect"], 1)  # 基线探测 + 工作 = 2
+        self.assertEqual(counts["close"], 1)
+        self.assertEqual(foreign_keys, 1)
+        self.assertEqual(meta, "1")
+
+    def test_list_command_connects_once(self):
+        store, _builders = _rich_live_store()
+        counts, patch = self._patch_connect()
+        with patch:
+            code, data = run_cli_json(
+                ["list", "--store-dir", str(store), "--json"]
+            )
+        self.assertEqual((code, data["status"]), (0, "OK"))
+        self.assertEqual(counts["connect"], 1)  # 基线探测 + 工作 = 2
+
+    def test_db_high_version_zero_leak(self):
+        store, _builders = _rich_live_store()
+        ctx = _ctx(store)
+        raw = sqlite3.connect(str(ctx.db_path))
+        raw.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+        raw.commit()
+        raw.close()
+        counts, patch = self._patch_connect()
+        with patch:
+            with self.assertRaises(topicdock.UnsupportedSchemaVersion):
+                ensure_store_healthy(ctx)
+        self.assertEqual(counts["connect"], counts["close"])
+        self.assertEqual(counts["connect"], 1)
+
+    def test_md_high_version_zero_leak(self):
+        store, builders = _rich_live_store()
+        ctx = _ctx(store)
+        md_path = builders["alpha"].md_path()
+        md_path.write_text(
+            md_path.read_text(encoding="utf-8").replace(
+                "schema_version: 1", "schema_version: 2"
+            ),
+            encoding="utf-8",
+        )
+        counts, patch = self._patch_connect()
+        with patch:
+            with self.assertRaises(topicdock.UnsupportedSchemaVersion):
+                ensure_store_healthy(ctx)
+        self.assertEqual(counts["connect"], counts["close"])
+        self.assertEqual(counts["connect"], 1)
+
+    def test_hop_high_version_zero_leak(self):
+        store, _builders = _rich_live_store()
+        ctx = _ctx(store)
+        hop_path = ctx.hops_dir / "hop-004.md"
+        hop_path.write_text(
+            hop_path.read_text(encoding="utf-8").replace('"v":1', '"v":2'),
+            encoding="utf-8",
+        )
+        counts, patch = self._patch_connect()
+        with patch:
+            with self.assertRaises(topicdock.UnsupportedSchemaVersion):
+                ensure_store_healthy(ctx)
+        self.assertEqual(counts["connect"], counts["close"])
+        self.assertEqual(counts["connect"], 1)
+
+
+class TestMatchMountCredentials(TopicDockTestCase):
+    """D9：match 前 ≤5 命中直返完整挂载凭证；第 6 项起 full:false 不附。"""
+
+    def test_top5_credentials_and_sixth_plain(self):
+        store = make_store()
+        build_big_corpus(store, n_topics=6, hops_per_topic=1)
+        code, data = run_cli_json(
+            ["match", "--topic", "核心结论", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        results = data["results"]
+        self.assertEqual(len(results), 6)
+        for entry in results[:5]:
+            self.assertTrue(entry["full"])
+            self.assertRegex(entry["head_hop"], r"^H\d+$")
+            self.assertRegex(entry["base_sha"], r"^[0-9a-f]{64}$")
+            self.assertIsInstance(entry["artifacts"], list)
+            self.assertIn("text", entry)
+        for entry in results[5:]:
+            self.assertFalse(entry["full"])
+            for key in ("head_hop", "base_sha", "artifacts", "text"):
+                self.assertNotIn(key, entry)
+
+    def test_recent_top5_credentials_same_shape(self):
+        store = make_store()
+        build_big_corpus(store, n_topics=6, hops_per_topic=1)
+        code, data = run_cli_json(
+            ["match", "--recent", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(data["results"]), 5)
+        for entry in data["results"]:
+            self.assertTrue(entry["full"])
+            self.assertIsNone(entry["score"])
+            self.assertRegex(entry["head_hop"], r"^H\d+$")
+            self.assertRegex(entry["base_sha"], r"^[0-9a-f]{64}$")
+            self.assertIn("artifacts", entry)
+
+
+TRACE_PAYLOAD = {
+    "topic_id": "trace-topic",
+    "title": "追踪主题",
+    "base_hop": None,
+    "base_sha": None,
+    "session_id": "ses-1",
+    "actor": "tester",
+    "mutations": [
+        {"op": "create", "track": "C", "statement": "追踪唯一关键词 zzqtrace"},
+        {"op": "create", "track": "Q", "statement": "未决问题一"},
+        {"op": "create", "track": "Q", "statement": "未决问题二"},
+        {"op": "create", "track": "A", "state": "~", "statement": "断点行动"},
+        {"op": "create", "track": "A", "state": "x", "statement": "完成行动"},
+    ],
+}
+
+
+class TestMatchAndUseTrace(TopicDockTestCase):
+    """D9：use/match `--trace <auto|items>` 同轮内联；空集 exit 7。"""
+
+    def _trace_store(self):
+        store = make_store()
+        code, saved = run_save(store, dict(TRACE_PAYLOAD), self.tmp_root)
+        self.assertEqual((code, saved["status"]), (0, "OK"))
+        return store
+
+    def test_match_trace_auto_and_explicit_and_missing(self):
+        store = self._trace_store()
+        code, data = run_cli_json(
+            ["match", "--topic", "zzqtrace", "--trace", "auto",
+             "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        entry = data["results"][0]
+        self.assertEqual(list(entry["traces"]), ["Q1", "Q2", "A1"])
+        for trace in entry["traces"].values():
+            self.assertEqual(trace["status"], "OK")
+            self.assertIn("successor_notes", trace)
+
+        code, data = run_cli_json(
+            ["match", "--topic", "zzqtrace", "--trace", "C1,Q9",
+             "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        traces = data["results"][0]["traces"]
+        self.assertIn("blocks", traces["C1"])
+        self.assertEqual(traces["Q9"], {"missing_item": True})
+
+    def test_use_trace_auto_excludes_completed_actions(self):
+        store = self._trace_store()
+        code, data = run_cli_json(
+            ["use", "trace-topic", "--trace", "auto",
+             "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(list(data["traces"]), ["Q1", "Q2", "A1"])
+        self.assertNotIn("A2", data["traces"])
+
+    def test_use_trace_explicit_item_shape_and_missing(self):
+        store = self._trace_store()
+        code, data = run_cli_json(
+            ["use", "trace-topic", "--trace", "C1,Q9",
+             "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        trace = data["traces"]["C1"]
+        self.assertEqual(
+            set(trace),
+            {"status", "topic_id", "item_id", "blocks", "links",
+             "successor", "successor_notes"},
+        )
+        self.assertTrue(trace["blocks"])
+        self.assertEqual(data["traces"]["Q9"], {"missing_item": True})
+
+    def test_use_single_topic_direct_mount_applies_trace(self):
+        store = self._trace_store()
+        code, data = run_cli_json(
+            ["use", "--trace", "auto", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(data["topic_id"], "trace-topic")
+        self.assertEqual(list(data["traces"]), ["Q1", "Q2", "A1"])
+
+    def test_use_list_branch_ignores_trace(self):
+        store = self._trace_store()
+        second = dict(TRACE_PAYLOAD)
+        second["topic_id"] = "trace-topic-2"
+        second["title"] = "第二主题"
+        code, saved = run_save(store, second, self.tmp_root)
+        self.assertEqual((code, saved["status"]), (0, "OK"))
+        code, data = run_cli_json(
+            ["use", "--trace", "auto", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(data["total"], 2)
+        self.assertNotIn("traces", data)
+
+    def test_use_empty_store_ignores_trace(self):
+        store = make_store()
+        code, data = run_cli_json(
+            ["use", "--trace", "auto", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        self.assertIsNone(data["topic_id"])
+        self.assertNotIn("traces", data)
+
+    def test_use_trace_empty_set_is_invalid(self):
+        store = self._trace_store()
+        code, data = run_cli_json(
+            ["use", "trace-topic", "--trace", ",", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 7)
+        self.assertEqual(data["status"], "INVALID_INPUT")

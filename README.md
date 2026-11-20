@@ -28,9 +28,9 @@ The engine uses only the Python ≥ 3.9 standard library, with no third-party de
 
 The authoritative workflow specification is [`SKILL.md`](SKILL.md). It defines three habits, which the installer wires into your agent as short resident rules.
 
-**Read (mount a topic).** The agent loads a topic only when it needs one. That happens at the first substantive topic of a session, when you name a topic (with `/topicdock`, or the `继续 <id|序号>` phrase, meaning "continue `<id|index>`"), or when you move mid-session to a topic that is not mounted yet. The agent then either runs `td use` or breaks your request into keywords for `td match`. After `td match` finds the target `topic_id`, the agent immediately runs `td use <topic_id>` in the same turn to get the full `base_sha` and complete the mount. Once a topic is mounted, later turns in the same session and role talk directly, with zero repeated lookups. After context compaction, or when the session switches agent role, the agent re-runs `td use <id>` using the `⚓` line from its previous message.
+**Read (mount a topic).** The agent loads a topic only when it needs one. That happens at the first substantive topic of a session, when you name a topic (with `/topicdock`, or the `继续 <id|序号>` phrase, meaning "continue `<id|index>`"), or when you move mid-session to a topic that is not mounted yet. The agent then either runs `td use` or breaks your request into keywords for `td match`. The first up to 5 `full: true` hits from `td match` (including `--recent`) come back directly with `head_hop`, the full 64-hex `base_sha`, the ledger `text`, and `artifacts`, so a single match completes the mount — no second `td use` in the same turn. Only when the target ranks 6th or later does the agent run one extra `td use <id>` to finish the mount. Once a topic is mounted, later turns in the same session and role talk directly, with zero repeated lookups. After context compaction, or when the session switches agent role, the agent re-runs `td use <id>` using the `⚓` line from its previous message.
 
-**Trace (go to the evidence).** The agent runs `td trace <topic_id> <item_id>` before answering in three cases:
+**Trace (go to the evidence).** The agent runs `td trace <topic_id> <item_id>` before answering in three cases (multiple items can be traced in one call: `td trace <topic> C1,C2,Q3`):
 1. You question, overturn, or dig into a mounted item (`[C]`, `[R]`, `[Q]`, or `[A]`, including folded, overturned, or merged items).
 2. A new session or role takes over an open `[Q]` or a `[~]` breakpoint and needs the multi-line reasoning and core evidence from earlier hops.
 3. The agent is building on existing `[C]`/`[R]` conclusions and the one-line summary does not settle an edge case.
@@ -169,18 +169,18 @@ The `echo` field returned by `td save` and `td merge` is the authoritative sourc
 - **Sealed-hop fallback:** `⚓ TopicDock: <id> (<old> 已封板 → 自动新建 <head_hop>@<sha6> | +1[C] +1[A])`. This appears when the previous head hop was sealed and the save automatically started a new hop.
 - **Regular / amend / merge:** `⚓ TopicDock: <id> (<head_hop>@<sha6> | …)`. An `--amend` save includes an ` amend` segment. When nothing new was created, the line shows `无新增条目` ("no new items").
 
-*Note: Engine output strings remain untranslated in v1 (prompt localization is tracked on a separate track).*
+*Note: The prompt and documentation surface are fully English in v1 (bilingual trigger words are kept). Engine runtime strings (`status`/`echo`/`hint`) and Markdown protocol literals are intentionally left in v1 Chinese, unchanged.*
 
 ## 11 Subcommands & Exit Codes
 
 | Command | Argument signature | What it does |
 |---|---|---|
 | `td init` | `--scope global\|local [--path <dir>]` | Initialize a store. Idempotent. |
-| `td use` | `[<topic_id\|index>]` | Mount a topic. Returns the full ledger and `(head_hop, base_sha)`. With no argument, it guides you based on how many topics exist. |
-| `td match` | `[--topic <kw> [--topic <kw2> …]] [--threshold 35] [--recent]` | Keyword scoring and recall. Ties are ordered by `updated_at` descending, then `topic_id` ascending. `--recent` skips `--topic` and returns the most recent topics (up to 5). |
+| `td use` | `[<topic_id\|index>] [--trace <auto\|items>]` | Mount a topic. Returns the full ledger and `(head_hop, base_sha)`. With no argument, it guides you based on how many topics exist. Optional `--trace auto` inlines, in the same turn, the full history blocks of all open `[Q]` items and `[~][A]` breakpoints. |
+| `td match` | `[--topic <kw> [--topic <kw2> …]] [--threshold 35] [--recent] [--trace <auto\|items>]` | Keyword scoring and recall. Ties are ordered by `updated_at` descending, then `topic_id` ascending. `--recent` skips `--topic` and returns the most recent topics (up to 5). The first 5 hits (`full: true`) carry the mount credentials `head_hop` / full `base_sha` / `artifacts`, so one match completes the mount; from the 6th on they are not attached. |
 | `td save` | `--stdin \| --json-file <path> [--amend] [--fork-as <new_id>] [--force-merge]` | The one authoritative write entry, with optimistic concurrency checking. The payload accepts an optional `model` string (omitted on new hops when blank; preserved on `--amend` when omitted). |
 | `td merge` | `<src_topic_id> <dst_topic_id> [--summary "..."] [--session-id] [--actor] [--model] [--next-focus]` | Cross-topic merge. Items from `src` are merged into `dst` and trace links stay unbroken. `--actor` and `--model` default to `""`. |
-| `td trace` | `<topic_id> <item_id>` | Pull every historical evidence block of an item. Overturned, folded, and merged items can still be traced. |
+| `td trace` | `<topic_id> <item_id> [<item2> …]` | Pull every historical evidence block of an item. Overturned, folded, and merged items can still be traced. Multiple items in one call (space or comma separated, e.g. `C1,C2,Q3`); single-item output is identical to the previous version. |
 | `td list` | `[--page P] [--page-size 10] [--all] [--filter "<kw>"]` | List topics in pages, ordered by `updated_at` descending. |
 | `td view` | `<topic_id\|index> [--history]` | Read-only view. `--history` prints the chain of hop summaries (including `model` when present). |
 | `td delete` | `<expr> [--dry-run] [--yes]` | Preview by default. `--yes` accepts only an explicit `topic_id` list. |

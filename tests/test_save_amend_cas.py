@@ -4,13 +4,22 @@ fork 分叉、ops 状态转移矩阵、D-P33 artifacts 流转、正向序列 reb
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
 
-from tests.util import TopicDockTestCase, dump_tables, make_store, run_cli_json, run_save
+from tests.util import (
+    ChainBuilder,
+    TopicDockTestCase,
+    build_rich_store,
+    dump_tables,
+    make_store,
+    run_cli_json,
+    run_save,
+)
 
 import topicdock
 from topicdock import (
@@ -1329,6 +1338,8 @@ class TestModelTraceField(TopicDockTestCase):
         }
         with mock.patch.object(
             topicdock, "_utc_now", return_value="2026-11-01T00:00:00Z"
+        ), mock.patch.object(
+            topicdock.uuid, "uuid4", return_value=topicdock.uuid.UUID(int=0)
         ):
             self.assertEqual(run_save(store_a, dict(payload), self.tmp_root)[0], 0)
             self.assertEqual(
@@ -1451,4 +1462,250 @@ class TestModelTraceField(TopicDockTestCase):
         self.assertEqual(
             {k: v for k, v in before.items() if k != "meta"},
             {k: v for k, v in after.items() if k != "meta"},
+        )
+
+
+class TestMerkleHeader(TopicDockTestCase):
+    """D8：六写点收口后的跳头 4 字段（topic_uid/parent_oids/origin_oids/hop_oid）。"""
+
+    def _hop(self, store, hop_id):
+        path = Path(store) / "hops" / topicdock.hop_file_name(hop_id)
+        return topicdock.parse_hop_md(path.read_text(encoding="utf-8"))
+
+    def _legacy_alpha(self):
+        """建 rich 语料（H001–H006 全为 pre-D8 旧跳）并纳管入库。"""
+        store = make_store()
+        build_rich_store(store)
+        ctx = StoreContext(Path(store))
+        conn, _ = ensure_store_healthy(ctx)
+        try:
+            alpha = conn.execute(
+                "SELECT head_hop, md_sha256 FROM topics WHERE topic_id='alpha'"
+            ).fetchone()
+        finally:
+            conn.close()
+        return store, alpha
+
+    def test_new_topic_has_merkle_header(self):
+        store = make_store()
+        code, _data, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        hop = self._hop(store, "H001")
+        self.assertRegex(hop.header["topic_uid"], r"^[0-9a-f]{32}$")
+        self.assertEqual(hop.header["parent_oids"], [])
+        self.assertRegex(hop.header["hop_oid"], r"^v1:[0-9a-f]{64}$")
+        self.assertEqual(hop.header["hop_oid"], topicdock.compute_hop_oid(hop))
+        self.assertNotIn("origin_oids", hop.header)
+
+    def test_second_hop_inherits_uid_and_parent_oids(self):
+        store = make_store()
+        code, data, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        uid = _hop_header(store, "H001")["topic_uid"]
+        code, d2 = run_save(store, {
+            "topic_id": "alpha", "base_hop": "H001", "base_sha": data["base_sha"],
+            "session_id": "ses-02", "mutations": [
+                {"op": "create", "track": "C", "statement": "第二跳结论"}]},
+            self.tmp_root)
+        self.assertEqual(code, 0)
+        self.assertEqual(d2["head_hop"], "H002")
+        h1, h2 = self._hop(store, "H001"), self._hop(store, "H002")
+        self.assertEqual(h2.header["topic_uid"], uid)
+        self.assertEqual(h2.header["parent_oids"], [topicdock.compute_hop_oid(h1)])
+        self.assertEqual(h2.header["hop_oid"], topicdock.compute_hop_oid(h2))
+        self.assertNotIn("origin_oids", h2.header)
+
+    def test_amend_keeps_uid_and_refreshes_hop_oid(self):
+        store = make_store()
+        code, data, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        before = self._hop(store, "H001")
+        uid = before.header["topic_uid"]
+        code, d2 = run_save(store, {
+            "topic_id": "alpha", "base_hop": "H001", "base_sha": data["base_sha"],
+            "session_id": "ses-01", "summary": "amend 后",
+            "mutations": [{"op": "create", "track": "C",
+                           "statement": "amend 新结论"}]},
+            self.tmp_root, "--amend")
+        self.assertEqual(code, 0)
+        self.assertTrue(d2["amend"])
+        after = self._hop(store, "H001")
+        self.assertEqual(after.header["topic_uid"], uid)
+        self.assertNotEqual(after.header["hop_oid"], before.header["hop_oid"])
+        self.assertEqual(after.header["hop_oid"], topicdock.compute_hop_oid(after))
+        self.assertEqual(after.header["parent_oids"], [])
+
+    def test_legacy_chain_new_hop_derives_deterministic_uid(self):
+        store, alpha = self._legacy_alpha()
+        code, data = run_save(store, {
+            "topic_id": "alpha", "base_hop": alpha["head_hop"],
+            "base_sha": alpha["md_sha256"], "session_id": "ses-new",
+            "mutations": [{"op": "create", "track": "C",
+                           "statement": "派生 uid 新跳"}]},
+            self.tmp_root)
+        self.assertEqual(code, 0)
+        earliest = self._hop(store, "H001")
+        expected = hashlib.sha256(
+            b"topicdock-topic-uid:v1\0"
+            + topicdock.compute_hop_oid(earliest).encode("utf-8")
+        ).hexdigest()[:32]
+        header = self._hop(store, data["head_hop"]).header
+        self.assertEqual(header["topic_uid"], expected)
+        self.assertEqual(header["parent_oids"], [topicdock.compute_hop_oid(
+            self._hop(store, "H004"))])
+        # 存量旧跳零后台改盘：4 字段均未被补写
+        for hop_id in ("H001", "H002", "H003", "H004"):
+            self.assertNotIn("topic_uid", self._hop(store, hop_id).header)
+
+    def test_fork_from_legacy_source_fresh_uid_and_empty_origin_slot(self):
+        store, alpha = self._legacy_alpha()
+        code, data = run_save(store, {
+            "topic_id": "alpha", "base_hop": alpha["head_hop"],
+            "base_sha": alpha["md_sha256"], "session_id": "ses-fork",
+            "mutations": []},
+            self.tmp_root, "--fork-as", "delta")
+        self.assertEqual(code, 0)
+        fork = self._hop(store, data["head_hop"])
+        self.assertRegex(fork.header["topic_uid"], r"^[0-9a-f]{32}$")
+        self.assertEqual(
+            fork.header["parent_oids"],
+            [topicdock.compute_hop_oid(self._hop(store, "H004"))],
+        )
+        # 源旧链无 uid → 外源槽位 ""；origin_hop_oid 照常实时重算
+        self.assertEqual(
+            fork.header["origin_oids"]["C2"],
+            ":C2@" + topicdock.compute_hop_oid(self._hop(store, "H002")),
+        )
+        self.assertEqual(
+            fork.header["origin_oids"]["C4"],
+            ":C4@" + topicdock.compute_hop_oid(self._hop(store, "H004")),
+        )
+        self.assertEqual(fork.header["hop_oid"], topicdock.compute_hop_oid(fork))
+
+    def test_amend_legacy_single_hop_derives_uid_from_pre_amend_state(self):
+        store = make_store()
+        builder = ChainBuilder(store, "legacy", "legacy 标题")
+        builder.add_hop("H001", [], [
+            topicdock.HopBlock(
+                item_id="C1", op="create", status="verified",
+                fields={"结论正文": "旧结论", "一句话依据": "旧依据"},
+            ),
+        ])
+        builder.write_md()
+        ctx = StoreContext(Path(store))
+        conn, _ = ensure_store_healthy(ctx)
+        try:
+            row = conn.execute(
+                "SELECT head_hop, md_sha256 FROM topics WHERE topic_id='legacy'"
+            ).fetchone()
+        finally:
+            conn.close()
+        old_hop = self._hop(store, "H001")
+        self.assertNotIn("topic_uid", old_hop.header)
+        expected = hashlib.sha256(
+            b"topicdock-topic-uid:v1\0"
+            + topicdock.compute_hop_oid(old_hop).encode("utf-8")
+        ).hexdigest()[:32]
+        code, data = run_save(store, {
+            "topic_id": "legacy", "base_hop": "H001",
+            "base_sha": row["md_sha256"], "session_id": "ses-01",
+            "actor": "tester", "summary": "amend 旧跳",
+            "mutations": [{"op": "create", "track": "C",
+                           "statement": "amend 新增"}]},
+            self.tmp_root, "--amend")
+        self.assertEqual(code, 0)
+        self.assertTrue(data["amend"])
+        after = self._hop(store, "H001")
+        self.assertEqual(after.header["topic_uid"], expected)
+        self.assertEqual(after.header["parent_oids"], [])
+        self.assertEqual(after.header["hop_oid"], topicdock.compute_hop_oid(after))
+        # 若在改后态才派生会得到不同 uid（锁定「先取旧态」顺序）
+        post_derive = hashlib.sha256(
+            b"topicdock-topic-uid:v1\0"
+            + topicdock.compute_hop_oid(after).encode("utf-8")
+        ).hexdigest()[:32]
+        self.assertNotEqual(after.header["topic_uid"], post_derive)
+
+
+class TestPublishedLedger(TopicDockTestCase):
+    """D8：独立封板台账 —— amend 降级与封板零扰动（QS-6 度量）。"""
+
+    def _oid(self, store, hop_id):
+        path = Path(store) / "hops" / topicdock.hop_file_name(hop_id)
+        hop = topicdock.parse_hop_md(path.read_text(encoding="utf-8"))
+        return topicdock.compute_hop_oid(hop)
+
+    def _seal(self, store, *oids):
+        ctx = StoreContext(Path(store))
+        with ctx.exclusive_lock():
+            topicdock.mark_published_oids(ctx, list(oids))
+
+    def _amend(self, store, data, statement):
+        return run_save(store, {
+            "topic_id": "alpha", "base_hop": data["head_hop"],
+            "base_sha": data["base_sha"], "session_id": "ses-01",
+            "mutations": [{"op": "create", "track": "C", "statement": statement}],
+        }, self.tmp_root, "--amend")
+
+    def test_unsealed_amend_in_place_then_sealed_degrades(self):
+        store = make_store()
+        code, data, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        code, in_place = self._amend(store, data, "未封板原地")
+        self.assertEqual(code, 0)
+        self.assertTrue(in_place["amend"])
+        self.assertFalse(in_place["degraded"])
+        self.assertEqual(in_place["head_hop"], "H001")
+        self.assertTrue((Path(store) / "hops" / "hop-001.md").is_file())
+        # 封板当前 head 的权威 oid 后再 amend → 自动降级新建下一跳
+        self._seal(store, self._oid(store, "H001"))
+        code, degraded = self._amend(store, in_place, "封板后降级")
+        self.assertEqual(code, 0)
+        self.assertFalse(degraded["amend"])
+        self.assertTrue(degraded["degraded"])
+        self.assertEqual(degraded["head_hop"], "H002")
+        self.assertIn("H001 已封板 → 自动新建 H002@", degraded["echo"])
+
+    def test_sealing_is_zero_byte_disturbance_and_no_cas_conflict(self):
+        store = make_store()
+        code, data, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        hop_path = Path(store) / "hops" / "hop-001.md"
+        md_path = Path(store) / "topics" / "alpha.md"
+        hop_before = hop_path.read_bytes()
+        md_before = md_path.read_bytes()
+        oid = self._oid(store, "H001")
+        self._seal(store, oid)
+        # 发布动作对 hop 分片与顶层 md 0 字节改写
+        self.assertEqual(hop_path.read_bytes(), hop_before)
+        self.assertEqual(md_path.read_bytes(), md_before)
+        self.assertEqual(
+            topicdock.read_published_oids(StoreContext(Path(store))),
+            ({oid}, False),
+        )
+        # 同主题另一窗口持未变 head 的旧 base_sha 正常保存（0 CAS 伪冲突）
+        code, advanced = run_save(store, {
+            "topic_id": "alpha", "base_hop": "H001", "base_sha": data["base_sha"],
+            "session_id": "ses-other", "mutations": [
+                {"op": "create", "track": "C", "statement": "他窗推进"}],
+        }, self.tmp_root)
+        self.assertEqual(code, 0)
+        self.assertEqual(advanced["head_hop"], "H002")
+
+    def test_mark_merges_existing_and_writes_sorted_v1(self):
+        store = make_store()
+        ctx = StoreContext(Path(store))
+        oid_a = "v1:" + "a" * 64
+        oid_b = "v1:" + "b" * 64
+        with ctx.exclusive_lock():
+            topicdock.mark_published_oids(ctx, [oid_b])
+            topicdock.mark_published_oids(ctx, [oid_a, oid_b])
+        self.assertEqual(
+            topicdock.read_published_oids(ctx), ({oid_a, oid_b}, False)
+        )
+        ledger = json.loads(
+            (Path(store) / ".topicdock-published.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            ledger, {"v": 1, "published_oids": sorted([oid_a, oid_b])}
         )

@@ -1,33 +1,33 @@
-# TopicDock CLI 契约速查（11 子命令 + 载荷 Schema + 输出契约 + 退出码）
+# TopicDock CLI Contract Quick Reference (11 subcommands + payload schema + output contract + exit codes)
 
-命令形态：`td <子命令> …`（`td` = 单文件引擎 `scripts/topicdock.py`；Python ≥ 3.9，仅标准库）。
-全局参数 `--json` / `--store-dir <dir>` / `--workspace <dir>` 可置于子命令前或后：`--json` 输出缩进 JSON（人类可读模式输出键值行）；`--store-dir` 显式指定库目录；`--workspace` 覆盖寻址起点（默认 cwd，向上冒泡至全局 `~/.topicdock/`，见 `SKILL.md` bootstrap 节）。
+Command form: `td <subcommand> ...` (`td` = the single-file engine `scripts/topicdock.py`; Python >= 3.9, standard library only).
+Global options `--json` / `--store-dir <dir>` / `--workspace <dir>` may appear before or after the subcommand: `--json` prints indented JSON (human-readable mode prints key-value lines); `--store-dir` sets the store directory explicitly; `--workspace` overrides the address-resolution start point (default cwd, bubbling up to the global `~/.topicdock/` — see the bootstrap section in `SKILL.md`).
 
-语法权威 `references/markdown-spec.md`（本文件不重复双模板语法）。
+Syntax authority: `references/markdown-spec.md` (this file does not repeat the dual-template syntax).
 
 ---
 
-## 1. 11 个子命令总表
+## 1. The 11 subcommands
 
-| 子命令 | 参数签名 | 核心行为与自愈保障 |
+| Subcommand | Signature | Core behavior & self-heal guarantees |
 |---|---|---|
-| `td init` | `--scope global\|local [--path <dir>]` | 初始化 `<store_dir>`（`.gitignore` + `.topicdock-meta.json`，DB 惰性创建）；有 `--path` 时额外写指针配置（global → `~/.agents/topicdock/config.json`，local → `<cwd>/.agents/topicdock.json`，内容 `{"store_dir":"<abs>"}`）；幂等成功返回现状 |
-| `td use` | `[<topic_id\|index>]` | 显式 selector（纯数字按 list 同序 1-based 序号，否则 topic_id）→ 返回 md 全文 + `(head_hop, base_sha 完整 64 hex)` + 关联文件三态探测；无参：0 主题引导 / 1 主题直通挂载 / ≥2 首页列表 + hint |
-| `td match` | `[--topic <kw> [--topic <kw2> …]] [--threshold 35] [--recent]` | 主 LLM 拆解关键词后调用；0~100 确定性打分，≥τ 全部召回（同分按 `updated_at` 倒序、`topic_id` 升序）；前 ≤5 附全文其余摘要；`--recent` 免 `--topic` 绕过打分直取最近 ≤5（排序同 `list/use`） |
-| `td save` | `--stdin \| --json-file <path> [--amend] [--fork-as <new_id>] [--force-merge]` | 唯一权威写入入口：`(base_hop, base_sha)` 双因子 CAS + 排他锁 + 四步落盘（hop 分片 → md 提交点 → DB 事务 + undo 压栈）；校验可选 `model` 类型；`--amend` 同 `session_id` 且 `live_refs(head_hop) == 1` 时原地合并；但双侧归一化 `actor` 均非空且剥离 `@model` 后主体不同时自动降级新建下一跳（输出 `degraded` 标注）；原地合并时空 head `actor` 遇非空载荷 `actor` 时回填该跳 `actor` |
-| `td merge` | `<src_topic_id> <dst_topic_id> [--summary "..."] [--session-id] [--actor] [--model] [--next-focus]` | src 有效条目按 dst `next_seq` 续编并入（`op=inherit, origin=src:item@hop`，trace 不断链）；生成 `[H_dst, H_src]` 双父合流跳（`--actor` 与 `--model` 默认 `""`，不继承双亲 `model`）；删 `src.md` 顶层文件（底层分片因被合流跳引用而保留）；undo 压栈 |
-| `td trace` | `<topic_id> <item_id>` | `item_hops` 正序 + `item_links` 跨主题递归上溯（环保护）+ 推翻去向块 + 后续去向尾注；已推翻/已解决/已折叠/已合流条目仍 100% 可查；缺失跳标注 `missing` |
-| `td list` | `[--page P] [--page-size 10] [--all] [--filter "<kw>"]` | `updated_at` 倒序每页 10 条，跨页全局连续编号（第 2 页 11~20）；`--filter` topic_id/title 大小写不敏感子串 |
-| `td view` | `<topic_id\|index> [--history]` | 纯只读；`--history` 从 hops + hop_edges 逆拓扑（head 最前）输出跳摘要链（跳头含非空 `str` 型 `model` 时附 `model` 字段）；断链输出可达部分 + `missing`/链中断标注 |
-| `td delete` | `<expr> [--dry-run] [--yes]` | 预览（默认 / `--dry-run`）：序号表达式 `2,4~6`、`keep 1,3` 解析为 topic_id 清单 + 独占跳数 + 缺失跳数；执行 `--yes` **仅接受显式 topic_id 列表**（免疫并发重排）；仅物理删除 `live_refs == 0` 的独占分片 |
-| `td undo` | `[--force]` | 弹出 `undo_stack` 栈顶（LIMIT 3）：post_hashes 校验（`--force` 仅放宽此层）+ 「无新增存活子跳引用」恒强制 → journal 原子写 → 幂等绝对还原（恢复 pre_files / 删新建 / per-topic 高水位 bump / rebuild 全库重算）→ 删 journal |
-| `td doctor` | `[--rebuild]` | 无参：七步自愈巡检 + 修复报告；`--rebuild`：强制从合法存活 Markdown 100% 冷重建 SQLite 图库与行尾短标 |
+| `td init` | `--scope global\|local [--path <dir>]` | Initializes `<store_dir>` (`.gitignore` incl. the `.topicdock-published.json` line + `.topicdock-meta.json`; the DB is created lazily); with `--path` it additionally writes the pointer config (global → `~/.agents/topicdock/config.json`, local → `<cwd>/.agents/topicdock.json`, content `{"store_dir":"<abs>"}`); idempotent, returns the current state |
+| `td use` | `[<topic_id\|index>] [--trace <auto\|items>]` | Explicit selector (pure digits = 1-based index in the same order as `list`, otherwise a topic_id) → returns the md full text + `(head_hop, base_sha full 64 hex)` + three-state artifact probing; optional `--trace` (takes a required value when present and may be omitted entirely — a single-value option with no `nargs="?"`, eliminating argparse ambiguity with the optional positional `topic`): `auto` inlines the full historical evidence blocks of all currently unresolved `[Q]` and `[~]`-state `[A]` items in the same call (`"traces": {"Q1": {...}, ...}`); a comma-separated id list (e.g. `C3,C4,Q3`) inlines the specified items' history blocks (a missing explicit item sets `"traces"[id]` to `{"missing_item": true}` without interrupting the mount); the no-selector list/empty-store branches ignore `--trace` |
+| `td match` | `[--topic <kw> [--topic <kw2> ...]] [--threshold 35] [--recent] [--trace <auto\|items>]` | Call after the primary LLM decomposes keywords; deterministic 0-100 scoring, full recall at `>= tau` (ties by `updated_at` DESC, then `topic_id` ASC); the top <=5 hits (`full: true`) return, besides `text`, **`head_hop`, full 64-hex `base_sha`, and `artifacts` directly** (the top-5 hits complete the formal mount in a single call — no second `td use` round; from the 6th item on, `full: false` without these fields); with `--trace <auto\|items>` the top <=5 `full: true` items additionally carry `"traces"`; `--recent` skips scoring and takes the <=5 most recent topics without `--topic` (same ordering as `list`/`use`) |
+| `td save` | `--stdin \| --json-file <path> [--amend] [--fork-as <new_id>] [--force-merge]` | The only authoritative write entry: `(base_hop, base_sha)` two-factor CAS + exclusive lock + four-step commit (hop shard → md commit point → DB transaction + undo push); validates the optional `model` type; all 6 hop-writing paths route through `_finalize_hop_merkle_header` to write `topic_uid / parent_oids / origin_oids / hop_oid`; when the head's authoritative `compute_hop_oid` is absent from the `.topicdock-published.json` seal ledger (and the ledger is not corrupt), `--amend` merges in place under the same `session_id` with `live_refs(head_hop) == 1`; otherwise it auto-degrades to a new next hop (`degraded` flagged in the output) — including a sealed head or a corrupt ledger; when the in-place head's `actor` is empty and the payload `actor` is non-empty, the head's `actor` is backfilled |
+| `td merge` | `<src_topic_id> <dst_topic_id> [--summary "..."] [--session-id] [--actor] [--model] [--next-focus]` | Merges src's live items into dst, renumbered per dst's `next_seq` (`op=inherit, origin=src:item@hop` — trace stays unbroken); generates a dual-parent consolidation hop `[H_dst, H_src]` (inherits dst's `topic_uid`; both parents' `parent_oids`; `--actor` and `--model` default to `""` and do not inherit either parent's `model`); deletes `src.md` (its shards survive via the consolidation hop's references); undo push |
+| `td trace` | `<topic_id> <item_id> [<extra_items> ...]` | Single- and multi-item lineage: positional `nargs="+"`, each element also accepts comma splitting (e.g. `C3,C4,Q3`), order-preserving dedupe, one exclusive lock and one in-memory `hop_cache`; **1 parsed item → the legacy single-item structure, 100% backward compatible**; >=2 items → any missing item reports `ITEM_NOT_FOUND` (exit code 5), all present → `{"status": "OK", "topic_id": ..., "item_ids": [...], "items": {...}}` (top-level `blocks` are not duplicated); internally walks `item_hops` in order + `item_links` cross-topic recursion (cycle-guarded) + overturn destination blocks + trailing destination notes; overturned/resolved/folded/consolidated items remain 100% traceable; missing hops are annotated `missing` |
+| `td list` | `[--page P] [--page-size 10] [--all] [--filter "<kw>"]` | `updated_at` DESC, 10 per page, continuous global numbering across pages (page 2 = 11-20); `--filter` is a case-insensitive substring match on topic_id/title |
+| `td view` | `<topic_id\|index> [--history]` | Purely read-only; `--history` outputs the hop summary chain from hops + hop_edges in reverse-topological order (head first; attaches `model` when the hop header has a non-empty `str` `model`); broken links output the reachable part + `missing`/chain-break annotations |
+| `td delete` | `<expr> [--dry-run] [--yes]` | Preview (default / `--dry-run`): index expressions `2,4~6`, `keep 1,3` resolve to a topic_id list + exclusive hop counts + missing hop counts; execution `--yes` **accepts only an explicit topic_id list** (immune to concurrent re-ordering); physically deletes only exclusive shards with `live_refs == 0` |
+| `td undo` | `[--force]` | Pops the `undo_stack` top (LIMIT 3): post_hashes verification (`--force` relaxes only this layer) + "no new live child-hop references" always enforced + **target hop sealed in `.topicdock-published.json` (or ledger corrupt) always enforced — `UNDO_BLOCKED`, exit code 7, `--force` cannot bypass either** → journal atomic write → idempotent absolute restore (restore pre_files / delete newly created / per-topic high-watermark bump / full-store recompute) → journal deleted |
+| `td doctor` | `[--rebuild]` | No args: seven-step self-heal inspection + repair reports + the two M2 reports (`published_ledger` seal-ledger check — missing/valid = `ok`, corrupt = `invalid`; `hop_oid_drift` non-destructive header-hash drift listing); `--rebuild`: forced 100% cold rebuild of the SQLite graph from valid surviving Markdown (the seal ledger is preserved) |
 
-所有命令启动均在排他锁下自动执行七步自愈（能修则修、不能修或 ID 被改则级联删除，绝不阻塞好主题）。
+Every command startup runs the seven-step self-heal under an exclusive lock (repair when possible; unrepairable corruptions or a changed ID cascade-delete; healthy topics are never blocked).
 
 ---
 
-## 2. `td save` 载荷 Schema（`--stdin` / `--json-file`，design §4.3(1) 权威）
+## 2. `td save` payload schema (`--stdin` / `--json-file`, authoritative per design §4.3(1))
 
 ```json
 {
@@ -54,81 +54,81 @@
 }
 ```
 
-- `topic_id`：`^[a-z0-9][a-z0-9-]{0,63}$`，创建后不可变；`title`：任意语言，可随时改（空/缺省 = 保持/继承）。
-- `actor` 归一化：`null`/空白串 → `""`（不落盘为 `"None"`）；`model`（可选）：`null`/缺省/`strip()` 后空白 → 缺省不写键，非 `None` 且非 `str` → `INVALID_INPUT`（退出码 7），落盘为 `strip()` 后值；新建跳不继承父跳 `model`，`--amend` 非空串更新、缺省/空白保留原值。
-- `base_hop: null` = 新建主题（场景 1）；`base_sha` 规则（D-P26）：完整 64-hex 相等，或 ≥12 位且为当前 `topics.md_sha256` 前缀。
-- **`--fork-as <new_id>`**：载荷 `topic_id` = 源主题 id，`--fork-as` = 新 id（正则合法且不存在）；源 = base_hop 处的状态（祖先分叉免 sha 校验）；新首跳 `parents=[base_hop]`、全部条目 `op=inherit, origin=src:item@<初始创建跳>` 拷入 + 载荷 mutations 同跳叠加；与 `--amend`/`--force-merge` 组合一律 `INVALID_INPUT`。
-- `artifacts` 流转：省略/`null` → 继承 base_hop 快照；`[]` → 清空；新列表 → 更新并剔除死链（D-P33）。
-- `fold` 前置校验：`from_items` 全部存在且 `[x]`，否则 `INVALID_INPUT`。
-- `retract` 形态：`{"op": "retract", "item_id": "<id>"}`（移除误建条目，不转入 `[R]`）。
+- `topic_id`: `^[a-z0-9][a-z0-9-]{0,63}$`, immutable after creation; `title`: any language, changeable anytime (empty/absent = keep/inherit).
+- `actor` normalization: `null`/whitespace → `""` (never stored as `"None"`); `model` (optional): `null`/absent/whitespace-after-`strip()` → key not written; a non-`None`, non-`str` value → `INVALID_INPUT` (exit code 7); stored as the `strip()`-ed value; a new hop never inherits the parent hop's `model`; on `--amend` a non-empty string updates it, absent/whitespace keeps the original.
+- `base_hop: null` = create a new topic (scenario 1); `base_sha` rule (D-P26): full 64-hex equality, or >=12 chars forming a prefix of the current `topics.md_sha256`.
+- **`--fork-as <new_id>`**: the payload `topic_id` = the source topic id, `--fork-as` = the new id (regex-valid and nonexistent); source = the state at base_hop (ancestor forks skip the sha check); the new first hop gets `parents=[base_hop]` and all items copied as `op=inherit, origin=src:item@<initial-creation-hop>` + the payload's mutations stacked in the same hop; combining with `--amend`/`--force-merge` is always `INVALID_INPUT`.
+- `artifacts` flow: omitted/`null` → inherit the base_hop snapshot; `[]` → clear; a new list → update and prune dead links (D-P33).
+- `fold` preconditions: every `from_items` entry exists and is `[x]`, otherwise `INVALID_INPUT`.
+- `retract` form: `{"op": "retract", "item_id": "<id>"}` (removes a mistaken item without moving it into `[R]`).
 
-### ops 状态转移矩阵（7 op × md 变更 × 分片变更 × amend 合并规则）
+### ops state-transition matrix (7 ops × md changes × shard changes × amend merge rules)
 
-| 操作 `op` | 适用轨道 | 对顶层 `topics/<id>.md` 的变更 | 对 `hops/hop-NNN.md` 与 `item_hops / item_links` 的变更 | 同跳 `--amend` 合并规则 |
+| Op | Tracks | Change to top-level `topics/<id>.md` | Change to `hops/hop-NNN.md` and `item_hops / item_links` | Same-hop `--amend` merge rule |
 |---|---|---|---|---|
-| `create` | `C / R / Q / A` | 分配新编号 `next_seq[T]++` 并追加至对应分节 | 写入 `### [<new_id>] (op=create, ...)`，`item_hops` 记 `op='create'` | 保持 `op=create` |
-| `update` | `C / R / Q / A` | 原地更新指定 `item_id` 的正文、依据或行动状态 `[x/~]` | 写入 `### [<id>] (op=update, ...)`，`item_hops` 记 `op='update'` | 若该条目系本跳刚 `create`，合并后仍保持 `op=create`（更新正文）；否则保持 `op=update` |
-| `overturn` | `C -> R` | 从 `[C]` 移除 `from_item`，分配新 `R<n>` 追加至 `[R]` 并标 `(原立H_orig→推翻H_cur)` | 写入 `### [R<n>] (op=overturn, from=C<k>, origin=...)`，记录 `item_links` | 若被推翻的 `C<k>` 系本跳刚建，直接替换为 `R<n> (op=create)` |
-| `resolve` | `Q -> C / R / None` | 从 `[Q]` 移除 `from_item`；若 `into_track='C'` 或 `'R'` 则同时新建对应条目 | 写入 `### [Q<k>] (op=resolve)`（及新建的 `### [C<n>]`），记录 `item_links` | 若 `Q<k>` 系本跳刚建且当跳即解决，直接收敛为结果条目 |
-| `fold` | `A -> A` | 从 `[A]` 移除指定的多个已完成 `- [x] A_i`，分配新 `- [x] A_new` 汇总行替换之 | 写入 `### [A_new] (op=fold, from=A1+A2+A3)`，记录 `item_links` | 合并 `from` 集合 |
-| `inherit` | 分叉/合流时的 `C/R/Q/A` | 分叉或 `td merge` 时将源主题条目按目标 `next_seq` 拷入目标顶层文件 | 写入 `### [<id>] (op=inherit, origin=<src_topic>:<src_id>@<hop>)`，串联跨主题 `trace` | 保持 `op=inherit` |
-| `retract` | `C / R / Q / A` | 移除误建或废弃的无意义条目（不转入 `[R]`） | 写入 `### [<id>] (op=retract)` | 若系本跳刚 `create`，直接从本跳分片中抵消删除 |
+| `create` | `C / R / Q / A` | Allocates a new number `next_seq[T]++` and appends to the matching section | Writes `### [<new_id>] (op=create, ...)`; `item_hops` records `op='create'` | Keeps `op=create` |
+| `update` | `C / R / Q / A` | Updates the given `item_id`'s body, basis, or action state `[x/~]` in place | Writes `### [<id>] (op=update, ...)`; `item_hops` records `op='update'` | If the item was just `create`-d in this hop, the merged block keeps `op=create` (body updated); otherwise stays `op=update` |
+| `overturn` | `C -> R` | Removes `from_item` from `[C]`, allocates a new `R<n>` appended to `[R]` tagged `(原立H_orig→推翻H_cur)` | Writes `### [R<n>] (op=overturn, from=C<k>, origin=...)`; records `item_links` | If the overturned `C<k>` was created in this hop, replaced directly by `R<n> (op=create)` |
+| `resolve` | `Q -> C / R / None` | Removes `from_item` from `[Q]`; if `into_track='C'` or `'R'`, also creates the new item | Writes `### [Q<k>] (op=resolve)` (and the new `### [C<n>]`); records `item_links` | If `Q<k>` was created in this hop and resolved in the same hop, converges into the result item |
+| `fold` | `A -> A` | Removes the given completed `- [x] A_i` rows, allocates a new `- [x] A_new` summary row in their place | Writes `### [A_new] (op=fold, from=A1+A2+A3)`; records `item_links` | Unions the `from` sets |
+| `inherit` | `C/R/Q/A` on fork/consolidation | On fork or `td merge`, copies source items into the target top-level file per the target's `next_seq` | Writes `### [<id>] (op=inherit, origin=<src_topic>:<src_id>@<hop>)`, chaining cross-topic `trace` | Keeps `op=inherit` |
+| `retract` | `C / R / Q / A` | Removes a mistaken or abandoned item (does not move into `[R]`) | Writes `### [<id>] (op=retract)` | If created in this hop, cancelled directly within this hop's shard |
 
-载荷 mutations 先规范化为 HopBlock 序列再逐块过唯一重放内核 `apply_hop_block`（正反两路同一函数）；载荷与主题状态不相容（如 `[retract X, update X]` 顺序非法、fold 自引用）→ `INVALID_INPUT` **零落盘**。
+Payload mutations are normalized into a HopBlock sequence and pass one by one through the single replay kernel `apply_hop_block` (both directions use the same function); a payload incompatible with topic state (e.g. `[retract X, update X]` illegal order, self-referencing fold) → `INVALID_INPUT` with **zero writes**.
 
 ---
 
-## 3. 输出 JSON 契约（`--json`；`status` 与退出码一一对应）
+## 3. Output JSON contract (`--json`; `status` maps 1:1 to exit codes)
 
-| 命令 | 成功载荷字段 |
+| Command | Success payload fields |
 |---|---|
 | `init` | `status/store_dir/scope/created(bool)` |
-| `save` | `status/topic_id/head_hop/base_sha(完整 64 hex)/amend/degraded/created{track:n}/echo(⚓行)/conflicts[]/overwritten[]`；fork 成功时 `topic_id` = 新 id |
-| `use` | `status/topic_id/text(md 全文)/head_hop/base_sha(完整)/artifacts[{name,path,note,status: ok\|missing\|moved,new_path?}]`；无 selector 0 主题 → `{status, topic_id: null, note}`；≥2 → list 首页字段 + `hint` |
+| `save` | `status/topic_id/head_hop/base_sha(full 64 hex)/amend/degraded/created{track:n}/echo(⚓ line)/conflicts[]/overwritten[]`; on fork success `topic_id` = the new id |
+| `use` | `status/topic_id/text(md full text)/head_hop/base_sha(full)/artifacts[{name,path,note,status: ok\|missing\|moved,new_path?}]`; with `--trace` also `traces{...}`; no selector and 0 topics → `{status, topic_id: null, note}`; >=2 → first-page list fields + `hint` |
 | `list` | `status/page/page_size/total/items[{index,topic_id,title,updated_at}]` |
-| `match` | `status/results[{topic_id,score,title,full(bool),text?(≤5 附全文)}]` |
-| `trace` | `status/topic_id/item_id/blocks[{hop_id,op,text?,missing?,from_topic?}]/links[]/successor[]/successor_notes[]` |
-| `view` | `status/topic_id/text` 或（`--history`）`history[{hop_id,created_at,actor,summary,model?,missing?,note?}]`（`model` 仅跳头含非空 `str` 时输出） |
-| `delete` | 预览：`status/topics[{topic_id,title}]/exclusive_hops/missing_hops`；执行：`status/deleted[]/exclusive_hops/missing_hops` |
+| `match` | `status/results[{topic_id,score,title,full(bool),text?(top-5 full text),head_hop?,base_sha?,artifacts?,traces?}]` (`head_hop`/`base_sha`/`artifacts` attach to the top <=5 `full: true` items; `traces` additionally when `--trace` is given) |
+| `trace` | single item (legacy, 100% compatible): `status/topic_id/item_id/blocks[{hop_id,op,text?,missing?,from_topic?}]/links[]/successor[]/successor_notes[]`; >=2 items: `status/topic_id/item_ids[]/items{<id>: <single-item trace dict>}` |
+| `view` | `status/topic_id/text` or (with `--history`) `history[{hop_id,created_at,actor,summary,model?,missing?,note?}]` (`model` output only when the hop header has a non-empty `str`) |
+| `delete` | preview: `status/topics[{topic_id,title}]/exclusive_hops/missing_hops`; execute: `status/deleted[]/exclusive_hops/missing_hops` |
 | `merge` | `status/topic_id/dst_topic_id/head_hop/base_sha/merged_items{track:n}/merged_from/echo` |
-| `undo` | 空栈：`{status,note:"回滚栈为空…"}`（退出 0）；成功：`status/restored[]/op_type/summary` |
-| `doctor` | `status/checks[{name,status: ok\|repaired\|deleted,detail?}]`（结构见 §7） |
+| `undo` | empty stack: `{status,note:"回滚栈为空…"}` (exit 0); success: `status/restored[]/op_type/summary` |
+| `doctor` | `status/checks[{name,status: ok\|repaired\|deleted\|invalid\|drift,detail?}]` (structure in §7) |
 
-⚓ 回显行（`save`/`merge` 的 `echo` 字段）三种格式：
+⚓ echo line (the `echo` field of `save`/`merge`), three formats — the Chinese words below (`新建`, `已封板 → 自动新建`, `无新增条目`) are exact runtime protocol literals, quoted verbatim:
 
-- 新建主题：`⚓ TopicDock: <id> (<head_hop>@<sha6> 新建 | +1[C] +1[R] +1[A])`
-- 封板降级：`⚓ TopicDock: <id> (<old> 已封板 → 自动新建 <head_hop>@<sha6> | +1[C] +1[A])`
-- 常规 / amend / merge：`⚓ TopicDock: <id> (<head_hop>@<sha6> | …)`（amend 带 ` amend` 段；无新增条目计 `无新增条目`）
+- New topic: `⚓ TopicDock: <id> (<head_hop>@<sha6> 新建 | +1[C] +1[R] +1[A])`
+- Sealed degradation: `⚓ TopicDock: <id> (<old> 已封板 → 自动新建 <head_hop>@<sha6> | +1[C] +1[A])`
+- Regular / amend / merge: `⚓ TopicDock: <id> (<head_hop>@<sha6> | …)` (amend carries an ` amend` segment; no new items count as `无新增条目`)
 
-sha 三源口径（D-P26）：CAS `base_sha` = `topics.md_sha256`；md `## 4.` 行 sha = `hops.md_sha256` 前 12 位；⚓ = `base_sha` 前 6 位；`use/save` JSON 恒返回完整 base_sha。
+The three sha sources (D-P26): the CAS `base_sha` = `topics.md_sha256`; the md `## 4.` line sha = the first 12 hex of `hops.md_sha256`; ⚓ = the first 6 of `base_sha`; `use/save` JSON always returns the full base_sha.
 
 ---
 
-## 4. 退出码表（0–7 全量）
+## 4. Exit code table (0-7, complete)
 
-| 码 | status | 语义 |
+| Code | status | Meaning |
 |---|---|---|
-| 0 | `OK` | 成功（含 undo 空栈提示、doctor 全 ok） |
-| 1 | `ERROR` | 未预期异常兜底（`{status, error:"<类型>: <信息>"}`，不 traceback） |
-| 2 | —（无 JSON） | argparse 用法错误（缺必选参数/未知子命令等） |
-| 3 | `UNINITIALIZED_STORE` | 冒泡与全局均未找到库：`{status, default_global:"~/.topicdock", workspace_local:"<cwd>/.topicdock"}` → bootstrap 引导 |
-| 4 | `STALE_BASE` | CAS 失步（载荷见 §5），绝不静默应用 |
-| 5 | `TOPIC_NOT_FOUND` / `ITEM_NOT_FOUND` | 主题/条目不存在（含 use/view/trace/merge/delete 的 selector 解析失败、`--yes` 引用不存在 id） |
-| 6 | `UNSUPPORTED_SCHEMA_VERSION` | `schema_version > 1` 或 hop 头 `v > 1`（任何写盘/删盘之前守卫） |
-| 7 | `INVALID_INPUT` | 输入类错误：载荷非 JSON/校验失败、`base_hop` 不在首父血缘链上、载荷引用已消失 item_id（附 `vanished_items`）、`--fork-as` 与 `--amend/--force-merge` 组合、fold 前置不满足、delete 表达式非法/越界、`UNDO_BLOCKED`（见 §6）、undo journal 残留入口拒绝 |
+| 0 | `OK` | Success (includes the undo empty-stack note and an all-`ok` doctor) |
+| 1 | `ERROR` | Unexpected-exception fallback (`{status, error:"<type>: <message>"}`, no traceback) |
+| 2 | — (no JSON) | argparse usage error (missing required option / unknown subcommand, etc.) |
+| 3 | `UNINITIALIZED_STORE` | Neither the bubble search nor the global dir found a store: `{status, default_global:"~/.topicdock", workspace_local:"<cwd>/.topicdock"}` → bootstrap onboarding |
+| 4 | `STALE_BASE` | CAS desync (payload in §5), never applied silently |
+| 5 | `TOPIC_NOT_FOUND` / `ITEM_NOT_FOUND` | Topic/item not found (selector resolution failures in use/view/trace/merge/delete, `--yes` referencing a nonexistent id, missing items in multi-item trace) |
+| 6 | `UNSUPPORTED_SCHEMA_VERSION` | `schema_version > 1` or hop header `v > 1` (guarded before any write/delete) |
+| 7 | `INVALID_INPUT` | Input-class errors: payload not JSON / validation failure, `base_hop` not on the first-parent lineage chain, payload referencing vanished item ids (with `vanished_items`), `--fork-as` combined with `--amend/--force-merge`, unmet fold preconditions, illegal/out-of-range delete expression, empty `--trace` item list (e.g. `","`), `UNDO_BLOCKED` (see §6.2), undo-journal-residue entry rejection |
 
 ---
 
-## 5. `STALE_BASE` 载荷与 5C 吸收流程（D-P24）
+## 5. The `STALE_BASE` payload and 5C absorption flow (D-P24)
 
-失配载荷字段：
+Mismatch payload fields:
 
 ```json
 {
   "status": "STALE_BASE",
   "topic_id": "auth-refactor",
   "current_head": "H006",
-  "current_sha": "<完整 64 hex>",
+  "current_sha": "<full 64 hex>",
   "hops_after_base": ["H005", "H006"],
   "changed_items": ["C2", "A1"],
   "conflicts": ["C2"],
@@ -136,44 +136,45 @@ sha 三源口径（D-P26）：CAS `base_sha` = `topics.md_sha256`；md `## 4.` �
 }
 ```
 
-- `hops_after_base`：base 之后的新跳；`changed_items`：这些跳变更过的条目；**冲突判据** = 载荷 mutations 触及的 item_id（update/overturn/resolve/fold/retract 目标）与 `changed_items` 的交集（`create` 不冲突），外加头部字段冲突（载荷带 `title`/`artifacts` 且 base 后 head 头同名字段变过 → `conflicts` 含 `"title"`/`"artifacts"`）。
-- `auto_absorbable = (conflicts 为空)`。
-- **吸收流程**：`auto_absorbable: true` → 换新 base 重发即吸收（必要时先 `td use` 刷新正文；`base_hop: current_head`、`base_sha: current_sha`）。
-- `auto_absorbable: false` → 提示用户二选一：`--fork-as <new_id>` 分叉（无覆盖风险；fork 遇同 head sha 失配仍可吸收，不改源主题）或 `--force-merge` 覆盖（以当前 head 为基重放，最后写入胜；成功响应附 `overwritten[]`，元素固定 `{item_id, by_hop}`；载荷引用已消失 item_id → `INVALID_INPUT` + `vanished_items`，退出 7）。
-- 特例：同 head 但 sha 失配（head 被另一窗口 amend）→ `{status:"STALE_BASE", reason:"BASE_SHA_MISMATCH_HEAD", changed_items:[], conflicts:[], auto_absorbable:false}`；`--force-merge` 同样放行。
-- 前置条件：`base_hop` 必须在当前 head 的首父血缘链上，否则 `INVALID_INPUT`（退出 7）。
+- `hops_after_base`: new hops after base; `changed_items`: items changed by those hops; **conflict criteria** = the intersection of the item ids touched by the payload's mutations (update/overturn/resolve/fold/retract targets) with `changed_items` (`create` never conflicts), plus header-field conflicts (a payload carrying `title`/`artifacts` while the post-base head changed the same-named field → `conflicts` includes `"title"`/`"artifacts"`).
+- `auto_absorbable = (conflicts is empty)`.
+- **Absorption flow**: `auto_absorbable: true` → re-send with the new base to absorb (call `td use` to refresh the body first if needed; `base_hop: current_head`, `base_sha: current_sha`).
+- `auto_absorbable: false` → present the user a two-way choice: `--fork-as <new_id>` fork (no overwrite risk; a fork hitting a same-head sha mismatch can still absorb, without modifying the source topic) or `--force-merge` overwrite (replays on top of the current head, last write wins; the success response attaches `overwritten[]` with elements fixed as `{item_id, by_hop}`; a payload referencing vanished item ids → `INVALID_INPUT` + `vanished_items`, exit 7).
+- Special case: same head but sha mismatch (the head was amended by another window) → `{status:"STALE_BASE", reason:"BASE_SHA_MISMATCH_HEAD", changed_items:[], conflicts:[], auto_absorbable:false}`; `--force-merge` still passes.
+- Precondition: `base_hop` must lie on the current head's first-parent lineage chain, otherwise `INVALID_INPUT` (exit 7).
 
 ---
 
-## 6. D-P20 / D-P35 窄窗口 roll-forward 与 `UNDO_BLOCKED`
+## 6. D-P20 / D-P35 narrow-window roll-forward and `UNDO_BLOCKED`
 
-### 6.1 引用中 hop 的 sha 失配分类（D-P20 收紧 + D-P35 加固）
+### 6.1 Referenced-hop sha mismatch classification (D-P20 tightened + D-P35 hardened)
 
-- **缺失** = 断链跳过不级联：`hops.md_sha256` 置 `MISSING`（不动 `topics.md_sha256`，保 CAS 稳定）；trace/view/delete 标注缺失跳号；仅当该主题 md 亦坏且重放需要该跳时才级联。
-- **roll-forward 唯一窗口**：sha 失配仅当**同时满足**「该 hop 是某存活主题的 head」+ `live_refs == 1` + （md `## 4.` sha 前缀 == 新文件哈希，**或** md 与 DB 同处旧态 = amend 2→3 / 3→4 崩溃窗口）+ 文件哈希与 `.topicdock-amend-pending.json` 记录（`{"hop_id", "expected_sha"}`，amend 原地合并前原子写、DB 提交后删除）匹配 → **以文件为准 roll-forward**（经重放内核重算该主题全部派生行与 md）。
-- **其余一切 sha 失配**（封板祖先、非 head、`live_refs > 1`、含语法合法的人为篡改）与无 pending 记录或失配、不可解析、头失配 → 一律视为**损坏** → 依赖主题按「能修则修、否则级联删除」处置，损坏 hop 文件随级联物理清理。
-- **merge ②③ 窄窗口 roll-forward**：merge 在「dst md 已写、DB 未提交」间崩溃 → 下次启动 ③ 崩溃纳管发现 dst head 是合流跳且 parents 含存活 src 的 head → 前滚补完合流（补删 src 行 + src.md）；此窗口 undo 无条目为已接受损失。
-- pending 记录删除一律延后到事务 commit 之后；无归属/已持久化的残留 pending 由自愈 sweep 清理（`pending_sweep` 报告项）。
+- **Missing** = broken-link skip, no cascade: `hops.md_sha256` set to `MISSING` (`topics.md_sha256` untouched, keeping CAS stable); trace/view/delete annotate the missing hop; cascade only when the topic's md is also broken and replay needs that hop.
+- **The single roll-forward window**: a sha mismatch rolls forward (file wins, recomputing all derived rows and the md via the replay kernel) only when **all** hold: the hop is some live topic's head + `live_refs == 1` + (the md `## 4.` sha prefix equals the new file hash, **or** md and DB are jointly stale = the amend 2→3 / 3→4 crash window) + the file hash matches the `.topicdock-amend-pending.json` record (`{"hop_id", "expected_sha"}`, atomically written before the in-place merge, deleted after the DB commit).
+- **All other sha mismatches** (sealed ancestors, non-head, `live_refs > 1`, including syntactically valid manual tampering) and mismatches with no pending record / a mismatching / unparseable / header-mismatched record → treated as **corrupted** → dependent topics handled as "repair when possible, else cascade-delete", with the corrupted hop file physically removed in the cascade.
+- **Merge windows (2)(3) narrow roll-forward**: if merge crashes between "dst md written" and "DB not committed", the next startup's crash-adoption step finds the dst head is a consolidation hop whose parents include a surviving src head → completes the consolidation (deleting src rows + src.md); undo has no entry for this window — accepted loss.
+- Pending-record deletion is always deferred until after the transaction commits; unowned/already-persisted pending residue is swept by self-heal (the `pending_sweep` report item).
 
 ### 6.2 `UNDO_BLOCKED`
 
-不设独立 status：一律 `{"status":"INVALID_INPUT", ...}` + 退出码 7，两种触发：
+No dedicated status: always `{"status":"INVALID_INPUT", ...}` + exit code 7. Three triggers:
 
-1. **子跳引用检查（恒强制，`--force` 不放宽）**：待移除/还原的跳存在后续存活子跳引用 → `{status:"INVALID_INPUT", detail:"UNDO_BLOCKED：跳存在后续存活子跳引用", blocked_hop, child_hop}`。
-2. **post_hashes 校验（`--force` 可放宽）**：磁盘文件哈希与快照不一致 → `{status:"INVALID_INPUT", detail:"UNDO_BLOCKED：磁盘文件哈希与快照不一致（--force 可放宽）", path, expected, actual}`。
+1. **Child-hop reference check (always enforced; `--force` does not relax)**: the hop to be removed/restored has later live child-hop references → `{status:"INVALID_INPUT", detail:"UNDO_BLOCKED：跳存在后续存活子跳引用", blocked_hop, child_hop}`. (The detail string is an exact runtime literal.)
+2. **Seal-ledger check (always enforced; `--force` cannot bypass)**: the target hop's authoritative `compute_hop_oid` is listed in `.topicdock-published.json`, **or the ledger is corrupt** (fail-closed) → undo is always blocked, including `delete`-type stack entries that carry no `new_hop`.
+3. **post_hashes verification (relaxable by `--force`)**: the on-disk file hash disagrees with the snapshot → `{status:"INVALID_INPUT", detail:"UNDO_BLOCKED：磁盘文件哈希与快照不一致（--force 可放宽）", path, expected, actual}`.
 
-另有 undo 入口拒绝：`.topicdock-undo-pending.json` journal 残留（上次回滚中断）→ `INVALID_INPUT` 退出 7，先手动删除该文件（heal 未接线，见 `references/markdown-spec.md` 已知边界）。
+Additionally, an undo entry rejection: a `.topicdock-undo-pending.json` journal residue (last rollback interrupted) → `INVALID_INPUT` exit 7; delete that file manually first (heal wiring not implemented — see the known-boundaries section of `references/markdown-spec.md`).
 
 ---
 
-## 7. `td doctor` 报告结构
+## 7. `td doctor` report structure
 
-无参 → 七步自愈巡检（顺序 ⑦ DB 缺失/损坏冷重建 → ⑥ meta 三源 max 修复 → ③ 崩溃纳管 → ① 野生文件清理 → ② 顶层 md 修复 → ⑤ 引用中 hop 分类处置 → ④ 孤儿 hop 清理），返回：
+No args → seven-step self-heal inspection (order: (7) missing/corrupt DB cold rebuild → (6) meta three-source max repair → (3) crash adoption → (1) wild-file cleanup → (2) top-level md repair → (5) referenced-hop classification → (4) orphan-hop cleanup), then appends the two M2 reports and returns:
 
 ```json
 {"status": "OK", "checks": [{"name": "meta_json", "status": "ok"}, {"name": "md_repair", "status": "repaired", "detail": "auth-refactor（重放还原）"}]}
 ```
 
-- `status ∈ {ok, repaired, deleted}`；健康库通常仅 `meta_json: ok`（已知边界见 markdown-spec §5）。
-- 已定义的 `name`：`rebuild_db` / `meta_json` / `adopt_crashed` / `tmp_sweep` / `wild_cleanup` / `md_repair` / `hop_missing` / `amend_rollforward` / `pending_sweep` / `orphan_cleanup` / `cascade_delete`。
-- `--rebuild` → 强制冷重建（`topicdock.db.tmp` 全表重放 → `os.replace` 原子替换 + 删旧 `-wal/-shm`），返回 `{status, checks:[{name:"rebuild_db", status:"repaired", detail}…]}`；仅纳入语法合法、文件名↔`topic_id` 一致、可达跳链完整的主题，损坏主题跳过并清理。
+- `status ∈ {ok, repaired, deleted}` for the heal steps; the ledger report adds `published_ledger` with `status ∈ {ok, invalid}` (`detail: "无封板记录"` when empty — an exact runtime literal), and `hop_oid_drift` with `status ∈ {ok, drift}` (drift items listed non-destructively; legacy hops without a `hop_oid` key do not count as drift; a per-hop `compute_hop_oid` failure degrades to that hop's report item instead of crashing doctor).
+- Defined `name` values: `rebuild_db` / `meta_json` / `adopt_crashed` / `tmp_sweep` / `wild_cleanup` / `md_repair` / `hop_missing` / `amend_rollforward` / `pending_sweep` / `orphan_cleanup` / `cascade_delete` / `published_ledger` / `hop_oid_drift`.
+- `--rebuild` → forced cold rebuild (full-table replay into `topicdock.db.tmp` → `os.replace` atomic swap + old `-wal/-shm` deleted), returning `{status, checks:[{name:"rebuild_db", status:"repaired", detail}...]}`; only topics that are syntactically valid, filename↔`topic_id` consistent, and have complete reachable hop chains are included — corrupted topics are skipped and cleaned up; the existing `.topicdock-published.json` is preserved.

@@ -6,6 +6,7 @@ import json
 import os
 import time
 from pathlib import Path
+from unittest import mock
 
 from tests.util import (
     TopicDockTestCase,
@@ -16,6 +17,7 @@ from tests.util import (
     make_store,
     run_cli,
     run_cli_json,
+    run_save,
 )
 
 import topicdock
@@ -37,6 +39,7 @@ from topicdock import (
 STORE_GITIGNORE = (
     "topicdock.db*\n.topicdock.lock\n*.tmp\n"
     ".topicdock-undo-pending.json\n.topicdock-amend-pending.json\n"
+    ".topicdock-published.json\n"
 )
 EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 ABC_SHA256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -695,6 +698,242 @@ class TestHopCodec(TopicDockTestCase):
         self.assertEqual(reparsed.blocks[0].fields["结论正文"], "第一行\n第二行\n### [伪装块标题]\n第四行\n\n空行后")
 
 
+class TestComputeHopOid(TopicDockTestCase):
+    """D8：位置无关 Merkle 内容哈希（固定 13 键 + 域分隔 SHA-256）。"""
+
+    def _legacy_header(self):
+        return {
+            "v": 1, "hop_id": "H001", "topic_origin": "legacy",
+            "title": "存量旧跳", "parents": [],
+            "session_id": "ses-legacy", "created_at": "2026-11-01T00:00:00Z",
+            "actor": "tester", "summary": "无 Merkle 字段",
+            "next_focus": "", "artifacts": [],
+        }
+
+    def _oid(self, header, blocks=None):
+        return topicdock.compute_hop_oid(
+            HopDoc(header=header, blocks=list(blocks or []))
+        )
+
+    def test_deterministic_and_shape(self):
+        hop = HopDoc(header=_mk_header(), blocks=_mk_blocks())
+        first = topicdock.compute_hop_oid(hop)
+        self.assertEqual(first, topicdock.compute_hop_oid(hop))
+        self.assertRegex(first, r"^v1:[0-9a-f]{64}$")
+
+    def test_position_independent_local_slots(self):
+        ext = {"topic_uid": "0123456789abcdef0123456789abcdef",
+               "parent_oids": ["v1:" + "b" * 64]}
+        base_oid = self._oid(_mk_header(**ext), _mk_blocks())
+        variants = [
+            _mk_header(hop_id="H999", **ext),
+            _mk_header(parents=["H001", "H002"], **ext),
+            _mk_header(topic_origin="renamed-topic", **ext),
+            _mk_header(hop_oid="v1:" + "f" * 64, sha12="000000000000", **ext),
+        ]
+        for header in variants:
+            self.assertEqual(self._oid(header, _mk_blocks()), base_oid)
+        local_origin_blocks = _mk_blocks()
+        local_origin_blocks[0].origin = "another-topic:C1@H999"
+        self.assertEqual(self._oid(_mk_header(**ext), local_origin_blocks), base_oid)
+        self.assertNotEqual(
+            self._oid(_mk_header(summary="改了摘要", **ext), _mk_blocks()), base_oid
+        )
+
+    def test_origin_item_included_but_origin_hop_ignored(self):
+        header = self._legacy_header()
+
+        def block(origin):
+            return HopBlock(item_id="C1", op="inherit", origin=origin,
+                            fields={"结论正文": "继承条目"})
+
+        first = self._oid(header, [block("src:C1@H001")])
+        self.assertEqual(first, self._oid(header, [block("src:C1@H999")]))
+        self.assertNotEqual(first, self._oid(header, [block("src:C2@H001")]))
+
+    def test_legacy_missing_extensions_equal_safe_defaults(self):
+        legacy = HopDoc(header=self._legacy_header(), blocks=[])
+        explicit = dict(self._legacy_header())
+        explicit.update({"topic_uid": "", "parent_oids": [], "origin_oids": {}})
+        self.assertEqual(
+            topicdock.compute_hop_oid(legacy),
+            topicdock.compute_hop_oid(HopDoc(header=explicit, blocks=[])),
+        )
+
+    def test_type_anomalies_normalized_safely(self):
+        weird = dict(
+            self._legacy_header(), topic_uid=None, parent_oids="oops",
+            origin_oids=[1, 2], model=123,
+            artifacts=[{"name": 1, "path": None, "note": None}],
+        )
+        safe = dict(
+            self._legacy_header(), topic_uid="", parent_oids=[],
+            origin_oids={},
+            artifacts=[{"name": "1", "path": "None", "note": ""}],
+        )
+        self.assertEqual(self._oid(weird), self._oid(safe))
+
+    def test_block_a_state_space_normalized(self):
+        plain = HopDoc(header=self._legacy_header(), blocks=[
+            HopBlock(item_id="A1", op="create", a_state=" ",
+                     fields={"结论正文": "行动"}),
+        ])
+        word = HopDoc(header=self._legacy_header(), blocks=[
+            HopBlock(item_id="A1", op="create", a_state="space",
+                     fields={"结论正文": "行动"}),
+        ])
+        self.assertEqual(
+            topicdock.compute_hop_oid(plain), topicdock.compute_hop_oid(word)
+        )
+
+    def test_golden_legacy_hop(self):
+        """跨解释器冻结向量 ①：存量旧跳（无 4 字段、零块）。"""
+        header = {
+            "v": 1, "hop_id": "H001", "topic_origin": "legacy-doc",
+            "title": "存量旧跳", "parents": [],
+            "session_id": "ses-legacy", "created_at": "2026-11-01T00:00:00Z",
+            "actor": "tester", "summary": "旧客户端写入，无 Merkle 字段",
+            "next_focus": "", "artifacts": [],
+        }
+        self.assertEqual(
+            self._oid(header),
+            "v1:a31b360aa2f721c61350d9a12e9360a399b28da4f70bc9483dd41cd093a2a62e",
+        )
+
+    def test_golden_rich_hop(self):
+        """跨解释器冻结向量 ②：块 + origin + artifacts + 非 ASCII。"""
+        header = {
+            "v": 1, "hop_id": "H042", "topic_origin": "认证-refactor",
+            "title": "認證模塊無狀態 JWT 改造 / Auth Stateless JWT Refactor",
+            "parents": ["H041"], "session_id": "ses-golden",
+            "created_at": "2026-11-16T09:15:00Z", "actor": "opencode/architect",
+            "model": "opencode-go/deepseek-v4.1-flash",
+            "summary": "推翻共享 Session(C1→R1)，确立 EdDSA(C2)",
+            "next_focus": "设计 Refresh Token 吊销机制",
+            "artifacts": [
+                {"name": "网关架构设计记录", "path": "/abs/design.md",
+                 "note": "定义 JWT 载荷字段与公钥轮换接口"},
+            ],
+            "topic_uid": "0123456789abcdef0123456789abcdef",
+            "parent_oids": ["v1:" + "a" * 64],
+            "origin_oids": {"R1": "0123456789abcdef0123456789abcdef:C1@v1:" + "b" * 64},
+        }
+        blocks = [
+            HopBlock(item_id="R1", op="overturn", from_items=["C1"],
+                     origin="认证-refactor:C1@H041",
+                     fields={"结论正文": "放弃全链路 Session 共享库",
+                             "一句话原因": "跨区同步延迟导致偶发 401"}),
+            HopBlock(item_id="C2", op="create", status="verified",
+                     fields={"结论正文": "EdDSA 短效 JWT（15m）",
+                             "一句话依据": "P99 从 18ms 降至 1.2ms"}),
+            HopBlock(item_id="A2", op="update", a_state="~",
+                     fields={"结论正文": "编写接口契约", "断点": "待敲定回调头"}),
+        ]
+        self.assertEqual(
+            self._oid(header, blocks),
+            "v1:e2247a2e70d9356539d75c8982a3aab07457d2e4e41fc64a97b9472b5a734917",
+        )
+
+
+class TestMerkleFaultTolerance(TopicDockTestCase):
+    """D8 读侧非破坏性容错：4 字段缺失/类型异常/hop_oid 漂移不得判损坏。"""
+
+    def _ctx(self):
+        ctx = StoreContext(self.tmp_root / "merkle-store")
+        ctx.hops_dir.mkdir(parents=True, exist_ok=True)
+        return ctx
+
+    def _write_hop(self, ctx, header, blocks=()):
+        path = ctx.hops_dir / topicdock.hop_file_name(header["hop_id"])
+        topicdock.atomic_write_text(
+            path, topicdock.render_hop_md(HopDoc(header=header, blocks=list(blocks)))
+        )
+        return path
+
+    def _valid_header(self, hop_id="H001", **over):
+        header = {
+            "v": 1, "hop_id": hop_id, "topic_origin": "alpha",
+            "title": "alpha 主题标题", "parents": [],
+            "session_id": "ses-01", "created_at": "2026-11-01T00:00:00Z",
+            "actor": "tester", "summary": "摘要", "next_focus": "",
+            "artifacts": [],
+        }
+        header.update(over)
+        return header
+
+    def test_load_hop_tolerates_missing_extension_fields(self):
+        ctx = self._ctx()
+        self._write_hop(ctx, self._valid_header())
+        loaded = topicdock._load_hop(ctx, "H001")
+        self.assertIsNotNone(loaded)
+        self.assertNotIn("topic_uid", loaded.hop.header)
+        self.assertNotIn("parent_oids", loaded.hop.header)
+        self.assertNotIn("origin_oids", loaded.hop.header)
+        self.assertNotIn("hop_oid", loaded.hop.header)
+
+    def test_load_hop_normalizes_extension_type_anomalies(self):
+        ctx = self._ctx()
+        self._write_hop(ctx, self._valid_header(
+            topic_uid=None, parent_oids="oops", origin_oids=[1, 2], hop_oid=None,
+        ))
+        loaded = topicdock._load_hop(ctx, "H001")
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.hop.header["topic_uid"], "")
+        self.assertEqual(loaded.hop.header["parent_oids"], [])
+        self.assertEqual(loaded.hop.header["origin_oids"], {})
+        self.assertEqual(loaded.hop.header["hop_oid"], "")
+
+    def test_hop_oid_drift_does_not_cascade(self):
+        store = make_store()
+        code, data = run_save(store, {
+            "topic_id": "alpha", "title": "alpha 主题标题", "base_hop": None,
+            "base_sha": None, "session_id": "ses-01", "actor": "tester",
+            "mutations": [{"op": "create", "track": "C", "statement": "结论"}],
+        }, self.tmp_root)
+        self.assertEqual(code, 0)
+        ctx = StoreContext(Path(store))
+        hop_path = ctx.hops_dir / topicdock.hop_file_name("H001")
+        hop = topicdock.parse_hop_md(hop_path.read_text(encoding="utf-8"))
+        hop.header["hop_oid"] = "v1:" + "0" * 64
+        topicdock.atomic_write_text(hop_path, topicdock.render_hop_md(hop))
+        conn = get_or_create_db(ctx)
+        conn.execute(
+            "UPDATE hops SET md_sha256=? WHERE hop_id='H001'",
+            (topicdock.file_sha256(hop_path),),
+        )
+        conn.commit()
+        conn.close()
+        conn, reports = ensure_store_healthy(ctx)
+        try:
+            self.assertIsNotNone(
+                conn.execute("SELECT 1 FROM topics WHERE topic_id='alpha'").fetchone()
+            )
+            self.assertNotIn("cascade_delete", [r["name"] for r in reports])
+            loaded = topicdock._load_hop(ctx, "H001")
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.hop.header["hop_oid"], "v1:" + "0" * 64)
+        finally:
+            conn.close()
+
+    def test_doctor_rebuild_preserves_legacy_hop_bytes(self):
+        store = make_store()
+        build_rich_store(store)
+        ctx = StoreContext(Path(store))
+        before = {
+            path.name: (path.read_bytes(), topicdock.file_sha256(path))
+            for path in sorted(ctx.hops_dir.glob("hop-*.md"))
+        }
+        code, _report = run_cli_json(
+            ["doctor", "--rebuild", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        after = {
+            path.name: (path.read_bytes(), topicdock.file_sha256(path))
+            for path in sorted(ctx.hops_dir.glob("hop-*.md"))
+        }
+        self.assertEqual(before, after)
+
+
 class TestFormatTraceTag(TopicDockTestCase):
     def test_single_and_short_chains(self):
         self.assertEqual(format_trace_tag(["H001"]), "(H001)")
@@ -1193,3 +1432,201 @@ class TestQS1RebuildIdentity(TopicDockTestCase):
             conn.close()
         self.assertLessEqual(elapsed, 0.5, f"重建耗时 {elapsed:.3f}s 超出 500ms 预算")
 
+
+
+# ---------- M3/D9: match_topics 批量 SQL + 打分口径冻结字面量 ----------
+
+
+class TestMatchTopicsBatch(TopicDockTestCase):
+    """match_topics 批量聚合后打分口径与基线逐字面量一致（先冻结后断言）。"""
+
+    def _seed(self):
+        store = make_store()
+        ctx = StoreContext(store)
+        conn = get_or_create_db(ctx)
+        self.addCleanup(conn.close)
+        docs = (
+            ("auth-jwt", "认证模块 JWT 改造", "2026-11-10T00:00:00Z",
+             "网关统一验签 EdDSA", None, "吊销机制"),
+            ("db-migration", "数据库灰度迁移", "2026-11-12T00:00:00Z",
+             None, "双写窗口多长", "回滚预案"),
+            ("auth-jwt-2", "认证模块 JWT 改造二", "2026-11-11T00:00:00Z",
+             None, None, None),
+        )
+        for topic_id, title, updated, c_stmt, q_stmt, focus in docs:
+            doc = TopicDoc(topic_id=topic_id, title=title, next_seq={})
+            if c_stmt:
+                doc.items["C"] = [
+                    TopicItem(item_id="C1", track="C", statement=c_stmt)
+                ]
+            if q_stmt:
+                doc.items["Q"] = [
+                    TopicItem(item_id="Q1", track="Q", statement=q_stmt)
+                ]
+            if focus:
+                doc.latest = LatestHop(hop_id="H001", next_focus=focus)
+            refresh_inverted_index(conn, topic_id, doc)
+            conn.execute(
+                "INSERT INTO topics(topic_id, title, head_hop, updated_at, last_actor,"
+                " next_seq_json, md_sha256) VALUES(?,?,?,?,?,?,?)",
+                (topic_id, title, "H001", updated, "tester", "{}", "x"),
+            )
+        conn.commit()
+        return conn
+
+    def _scores(self, conn, queries, threshold=35.0):
+        return [
+            (row["topic_id"], row["score"])
+            for row in match_topics(conn, queries, threshold=threshold)
+        ]
+
+    def test_frozen_scoring_literals(self):
+        conn = self._seed()
+        # 基线代码冻结（2026-11-20，M3 改动前）：中文二元组 / 多词组 / 同分 updated_at 倒序。
+        self.assertEqual(
+            self._scores(conn, ["认证模块"]),
+            [("auth-jwt-2", 75), ("auth-jwt", 75)],
+        )
+        self.assertEqual(
+            self._scores(conn, ["th-jw"]),
+            [("auth-jwt-2", 75), ("auth-jwt", 75)],
+        )
+        self.assertEqual(
+            self._scores(conn, ["认证模块", "JWT 改造", "认证"]),
+            [("auth-jwt-2", 100), ("auth-jwt", 100)],
+        )
+        self.assertEqual(
+            self._scores(conn, ["网关统一验签"]), [("auth-jwt", 50)]
+        )
+        self.assertEqual(self._scores(conn, ["网关验签"]), [])
+        self.assertEqual(self._scores(conn, ["完全不相关关键词"]), [])
+        self.assertEqual(
+            self._scores(conn, ["数据库灰度迁移", "验签"]),
+            [("db-migration", 75), ("auth-jwt", 50)],
+        )
+        self.assertEqual(
+            self._scores(conn, ["JWT 改造"]),
+            [("auth-jwt-2", 75), ("auth-jwt", 75)],
+        )
+        self.assertEqual(
+            self._scores(conn, ["数据库灰度迁移"]), [("db-migration", 75)]
+        )
+        # focus 字段全词组命中：0.6*1.5/2.4*100 的浮点结果冻结为 37。
+        self.assertEqual(self._scores(conn, ["吊销机制"]), [("auth-jwt", 37)])
+
+    def test_frozen_threshold_boundary(self):
+        conn = self._seed()
+        # score == threshold 仍召回；threshold+1 即排除。
+        self.assertEqual(
+            self._scores(conn, ["网关统一验签"], threshold=50.0),
+            [("auth-jwt", 50)],
+        )
+        self.assertEqual(
+            self._scores(conn, ["网关统一验签"], threshold=51.0), []
+        )
+        self.assertEqual(
+            self._scores(conn, ["吊销机制"], threshold=37.0),
+            [("auth-jwt", 37)],
+        )
+
+    def test_batch_select_count_bounded(self):
+        conn = self._seed()
+        # 1100 个唯一 token → 3 个 500-token 块；SELECT 次数 ≤ 1 + 2*3。
+        queries = [" ".join(f"z{index}" for index in range(1100))]
+        statements: list[str] = []
+
+        def _trace(sql):
+            if sql.lstrip().upper().startswith("SELECT"):
+                statements.append(sql)
+
+        conn.set_trace_callback(_trace)
+        try:
+            match_topics(conn, queries)
+        finally:
+            conn.set_trace_callback(None)
+        self.assertGreaterEqual(len(statements), 2)  # topics 行 + 至少一个批次
+        self.assertLessEqual(len(statements), 1 + 2 * 3)
+
+
+# ---------- M3/D9: _load_hop 单次读盘 / 换行归一 / _walk_origin_chain 跨步复用 ----------
+
+
+class TestHopHotPathIo(TopicDockTestCase):
+    def _ctx(self):
+        ctx = StoreContext(self.tmp_root / "hop-io-store")
+        ctx.hops_dir.mkdir(parents=True, exist_ok=True)
+        return ctx
+
+    def _header(self, hop_id="H001", **over):
+        header = {
+            "v": 1, "hop_id": hop_id, "topic_origin": "alpha",
+            "title": "alpha 主题标题", "parents": [],
+            "session_id": "ses-01", "created_at": "2026-11-01T00:00:00Z",
+            "actor": "tester", "summary": "摘要", "next_focus": "",
+            "artifacts": [],
+        }
+        header.update(over)
+        return header
+
+    def _write_hop(self, ctx, header, blocks=()):
+        path = ctx.hops_dir / topicdock.hop_file_name(header["hop_id"])
+        atomic_write_text(path, render_hop_md(HopDoc(header=header, blocks=list(blocks))))
+        return path
+
+    def test_load_hop_reads_disk_once_and_sha_matches_raw_bytes(self):
+        ctx = self._ctx()
+        path = self._write_hop(ctx, self._header())
+        real_open = Path.open
+        opens = {"n": 0}
+
+        def _counting_open(self, *args, **kwargs):
+            opens["n"] += 1
+            return real_open(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", _counting_open):
+            loaded = topicdock._load_hop(ctx, "H001")
+        self.assertIsNotNone(loaded)
+        self.assertEqual(opens["n"], 1)  # 单次读盘（基线 read_text + file_sha256 = 2）
+        self.assertEqual(loaded.sha, file_sha256(path))
+
+    def test_load_hop_normalizes_crlf_and_isolated_cr(self):
+        ctx = self._ctx()
+        blocks = [
+            HopBlock(item_id="C1", op="create", status="verified",
+                     fields={"结论正文": "换行容错"}),
+        ]
+        text = render_hop_md(HopDoc(header=self._header(), blocks=blocks))
+        path = ctx.hops_dir / topicdock.hop_file_name("H001")
+        for newline in ("\r\n", "\r"):
+            path.write_bytes(text.replace("\n", newline).encode("utf-8"))
+            loaded = topicdock._load_hop(ctx, "H001")
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.hop.header["hop_id"], "H001")
+            self.assertEqual([b.item_id for b in loaded.hop.blocks], ["C1"])
+            self.assertEqual(loaded.sha, file_sha256(path))
+
+    def test_walk_origin_chain_loads_each_hop_once(self):
+        store = make_store()
+        build_rich_store(store)
+        ctx = StoreContext(Path(store))
+        real_open = Path.open
+        counts: dict[str, int] = {}
+
+        def _counting_open(self, *args, **kwargs):
+            key = str(self)
+            counts[key] = counts.get(key, 0) + 1
+            return real_open(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", _counting_open):
+            chain, missing, invalid = topicdock._walk_origin_chain(
+                ctx, "H004", "alpha"
+            )
+        self.assertIsNotNone(chain)
+        self.assertIsNone(missing)
+        self.assertIsNone(invalid)
+        self.assertEqual(
+            [loaded.hop.header["hop_id"] for loaded in chain],
+            ["H001", "H002", "H003", "H004"],
+        )
+        for hop_path in sorted(ctx.hops_dir.glob("hop-00[1-4].md")):
+            self.assertEqual(counts.get(str(hop_path), 0), 1)

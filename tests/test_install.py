@@ -5,6 +5,7 @@ uninstall 归属（AGENTS.md 跨 client 探测 / CLAUDE.md 仅 claude）、引�
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -75,10 +76,13 @@ class InstallLayoutTestCase(TopicDockTestCase):
         text = self._memory_file(client).read_text(encoding="utf-8")
         self.assertEqual(text.count(SENTINEL_BEGIN), count)
         self.assertEqual(text.count(SENTINEL_END), count)
-        self.assertIn("- **TopicDock 调取（Read）**", text)
-        self.assertIn("- **TopicDock 追根（Trace）**", text)
-        self.assertIn("- **TopicDock 沉淀（Write）**", text)
-        self.assertIn("td 退出码: 0=OK", text)
+        self.assertIn("## TopicDock Resident Rules (auto-injected by scripts/install.py; do not edit manually)", text)
+        self.assertIn("- **TopicDock Read (Mount)**:", text)
+        self.assertIn("- **TopicDock Trace (Lineage)**:", text)
+        self.assertIn("- **TopicDock Write (Distill)**:", text)
+        self.assertIn("td exit codes: 0=OK", text)
+        self.assertIn("- **Invoke**: `python3", text)
+        self.assertIn("- **Exit codes**: td exit codes:", text)
         self.assertIn("scripts/topicdock.py", text)
 
 
@@ -184,7 +188,46 @@ class TestSentinelIdempotent(InstallLayoutTestCase):
         updated = memory.read_text(encoding="utf-8")
         self.assertEqual(updated.count(SENTINEL_BEGIN), 1)
         self.assertNotIn("stale/old-engine.py", updated)
-        self.assertIn("- **TopicDock 调取（Read）**", updated)
+        self.assertIn("- **TopicDock Read (Mount)**", updated)
+
+
+class TestWakeupRulesFailFast(InstallLayoutTestCase):
+    """守则提取失败必须显式报错（SKILL.md 不可读 / 锚点不足 3 行），绝不静默注入零守则块。"""
+
+    def _fresh_install_module(self):
+        spec = importlib.util.spec_from_file_location(
+            f"topicdock_install_under_test_{id(self)}", _INSTALL
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_unreadable_skill_md_raises(self):
+        mod = self._fresh_install_module()
+        mod._SKILL_MD = self.tmp_root / "missing" / "SKILL.md"
+        with self.assertRaises(SystemExit):
+            mod._wakeup_rules()
+
+    def test_insufficient_anchors_abort_install_without_block(self):
+        fake = self.tmp_root / "fake-skill" / "SKILL.md"
+        fake.parent.mkdir(parents=True)
+        fake.write_text(
+            "# Fake Skill\n\n- **TopicDock Read (Mount)**: only one anchor here\n",
+            encoding="utf-8",
+        )
+        mod = self._fresh_install_module()
+        mod._SKILL_MD = fake
+        with self.assertRaises(SystemExit) as ctx:
+            mod.main(["--client", "cursor"])
+        # 必须是守则提取失败（锚点计数实证），而非其他路径的退出
+        self.assertIn("found 1", str(ctx.exception))
+        self.assertIn("resident wakeup rules", str(ctx.exception))
+        # 钉死：SKILL.md 不可读时 AGENTS.md 不得被创建/注入守则块
+        agents_md = self.workspace_dir / "AGENTS.md"
+        self.assertFalse(
+            agents_md.exists() and SENTINEL_BEGIN in agents_md.read_text(encoding="utf-8"),
+            "守则提取失败时不得静默注入零守则块",
+        )
 
 
 class TestUninstall(InstallLayoutTestCase):

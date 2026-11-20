@@ -250,13 +250,20 @@ def tokenize(text: object) -> set[str]:
     return tokens
 
 
+_MATCH_TOKEN_CHUNK = 500
+
+
 def match_topics(
     conn: sqlite3.Connection,
     queries: list[str],
     threshold: float = 35.0,
     recent: bool = False,
 ) -> list[dict]:
-    """td match 0~100 归一化打分（design §4.1）；--recent 直取最近 ≤5（D-P16）。"""
+    """td match 0~100 归一化打分（design §4.1）；--recent 直取最近 ≤5（D-P16）。
+
+    倒排命中按 ≤500 token/块批量聚合（design §3 L3 行），一次建
+    `{(token, topic_id): max_weight}` 映射后再纯 Python 计分。
+    """
     topic_rows = conn.execute(
         "SELECT topic_id, title, updated_at FROM topics"
         " ORDER BY updated_at DESC, topic_id ASC"
@@ -271,13 +278,23 @@ def match_topics(
             }
             for row in topic_rows[:5]
         ]
+    phrase_specs = [(str(phrase).lower(), tokenize(phrase)) for phrase in queries]
+    all_tokens = sorted({token for _text, tokens in phrase_specs for token in tokens})
+    weight_map: dict[tuple[str, str], float] = {}
+    for start in range(0, len(all_tokens), _MATCH_TOKEN_CHUNK):
+        chunk = all_tokens[start : start + _MATCH_TOKEN_CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        for weight_row in conn.execute(
+            "SELECT token, topic_id, MAX(weight) AS max_weight FROM inverted_index "
+            f"WHERE token IN ({placeholders}) GROUP BY token, topic_id",
+            chunk,
+        ):
+            weight_map[(weight_row["token"], weight_row["topic_id"])] = weight_row["max_weight"]
     results: list[dict] = []
     for row in topic_rows:
         topic_id, title = row["topic_id"], row["title"]
         phrase_scores: list[float] = []
-        for phrase in queries:
-            phrase_text = str(phrase).lower()
-            tokens = tokenize(phrase)
+        for phrase_text, tokens in phrase_specs:
             if not tokens:
                 continue
             if phrase_text in title.lower() or phrase_text in topic_id.lower():
@@ -285,13 +302,9 @@ def match_topics(
                 continue
             matched_weights: dict[str, float] = {}
             for token in tokens:
-                weight_rows = conn.execute(
-                    "SELECT field, weight FROM inverted_index "
-                    "WHERE token=? AND topic_id=?",
-                    (token, topic_id),
-                ).fetchall()
-                if weight_rows:
-                    matched_weights[token] = max(w["weight"] for w in weight_rows)
+                weight = weight_map.get((token, topic_id))
+                if weight is not None:
+                    matched_weights[token] = weight
             if not matched_weights:
                 phrase_scores.append(0.0)
                 continue

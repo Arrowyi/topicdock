@@ -1,28 +1,28 @@
 ---
-description: TopicDock 主题记忆入口——无参列出可选主题并引导挂载/建档，带参直通挂载对应主题
+description: "TopicDock topic memory entry — with no arguments, list available topics and guide mounting/creation; with an argument, mount that topic directly. Keywords: topic memory / 主题记忆, continue <id|index> / 继续 <id|序号>, delete <index> / 删 <序号>."
 ---
 <!-- topicdock:command-managed -->
 
-# /topicdock：TopicDock 主题挂载
+# /topicdock: TopicDock Topic Mount
 
-用户调用了 `/topicdock` 命令，命令后的附加参数为：$ARGUMENTS
+The user invoked the `/topicdock` command; the text appended after the command is: $ARGUMENTS
 
-## 一、先判断参数
+## 1. Check the arguments first
 
-- 若命令后附带参数且形如 `<id|序号>`（主题 id，如 `auth-refactor`；或列表序号，如 `3`），则**直通挂载**：调用 `td use <id|序号>`，把返回的账本正文作为当前上下文，随后按 `topicdock` Skill 的三支柱工作流（Read 调取 / Trace 追根 / Write 沉淀，见技能 `SKILL.md`）继续对话，本模板不复述工作流细节。
-- 否则（无附加参数，或参数不像 `<id|序号>`），走下面的**无参引导流**。
+- If arguments follow the command and look like `<id|序号>` (a topic id such as `auth-refactor`, or a list index such as `3`), **mount directly**: call `td use <id|序号> --trace auto`, treat the returned ledger body as the current context, then continue the conversation per the `topicdock` skill's three-pillar workflow (Read / Trace / Write — see the skill's `SKILL.md`); this template does not repeat the workflow details.
+- Otherwise (no appended arguments, or the argument does not look like `<id|序号>`), follow the **no-argument guidance flow** below.
 
-## 二、无参引导流
+## 2. No-argument guidance flow
 
-调用 `td use`（不带参数），按返回结果向用户呈现三种情形：
+Call `td use` (without arguments) and present one of three situations to the user based on the result:
 
-1. **库内 0 个主题**：告知用户当前还没有任何主题，请用户说明本次要开展的课题；随后按 `SKILL.md` 的 Write 工作流以 `base_hop: null` 首次保存建档（`td save`），建档成功后在回复末尾回显 ⚓ 行。
-2. **库内恰好 1 个主题**：不展示列表，直接挂载该主题并展示账本正文。
-3. **库内 ≥ 2 个主题**：展示第 1 页列表——列表行在上，格式 `序号 | 标题 | id | 更新时间`；操作提示在列表下方，用自然语言，且**按列表实际状态收敛**（不适用的项不写）：
+1. **0 topics in the store**: tell the user there is no topic yet and ask what subject this session should work on; then, per the `SKILL.md` Write workflow, save the first topic with `base_hop: null` (`td save`), and echo the ⚓ line at the end of the reply after creation succeeds.
+2. **Exactly 1 topic in the store**: show no list; mount that topic directly and display the ledger body.
+3. **2 or more topics in the store**: show the first page of the list — list rows on top, format `序号 | 标题 | id | 更新时间`; operation hints below the list, in natural language, **converged to the list's actual state** (omit items that do not apply):
 
-   - 始终写：「回复序号即可挂载对应主题。」
-   - 始终写：「回复 `删 <序号>` 表示想删除某主题：我会先给出删除预览，你显式回复该主题的完整 topic_id 后才会真正删除。」（收到 `删 <序号>` 时：先调 `td delete <id> --dry-run` 把预览展示给用户，等用户显式回复该 topic_id 确认后，再执行 `td delete <topic_id> --yes`。）
-   - 列表还有后续页时才写：「回复『下一页』查看更多，或回复『全部』一次列出所有主题。」仅一页时不写本条。
-   - 始终写：「也可以直接给出关键词，我只列出匹配的主题。」（收到关键词后按关键词过滤再出列表。）
+   - Always write: "Reply with an index to mount the corresponding topic."
+   - Always write: "Reply `删 <序号>` (delete <index>) if you want a topic removed: I will first show a deletion preview, and will execute only after you explicitly reply with that topic's full topic_id." (On receiving `删 <序号>`: first call `td delete <id> --dry-run` and show the preview; after the user explicitly replies with that topic_id, execute `td delete <topic_id> --yes`.)
+   - Only when further pages exist: "Reply 'next page' / 『下一页』 to see more, or reply 'all' / 『全部』 to list every topic at once." Do not write this line when there is only one page.
+   - Always write: "You may also give keywords directly, and I will list only the matching topics." (On receiving keywords, filter by them and re-list.)
 
-列表只用于选择与删除。挂载成功后，按 `SKILL.md` 三支柱工作流继续。
+The list is for selection and deletion only. After mounting succeeds, continue per the `SKILL.md` three-pillar workflow.

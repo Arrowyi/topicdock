@@ -1,14 +1,16 @@
-# TopicDock 双 Markdown 语法规范（`topics/<id>.md` 与 `hops/hop-NNN.md`）
+# TopicDock Dual Markdown Syntax Specification (`topics/<id>.md` and `hops/hop-NNN.md`)
 
-本文件是 design §4.2 的成文版：两个模板的逐字段语法、防注入转义规则、行尾短标降级链与编号水位线。**当前 `SUPPORTED_SCHEMA_VERSION = 1`**；读入 `schema_version > 1` 或 hop 头 `v > 1` 时拒绝并返回 `UNSUPPORTED_SCHEMA_VERSION`（退出码 6），任何写盘/删盘之前先做版本守卫。
+This file is the written form of design §4.2: per-field syntax of both templates, anti-injection escaping rules, the trailing short-tag downgrade chain, and numbering watermarks. **Current `SUPPORTED_SCHEMA_VERSION = 1`**; reading `schema_version > 1` or a hop header `v > 1` is rejected with `UNSUPPORTED_SCHEMA_VERSION` (exit code 6) before any write/delete.
 
-总不变量：`parse(render(doc)) == doc`（双向恒等）；顶层 md 与 hop 分片均**仅允许经 `td` 命令写入**，手动修改一律视为文件破坏（自愈详见 `references/cli-contract.md` doctor 节）。
+Global invariant: `parse(render(doc)) == doc` (bidirectional identity). Both the top-level md and hop shards are **writable only via `td` commands**; any manual modification counts as file corruption (self-healing: see the `doctor` section in `references/cli-contract.md`).
+
+> **Protocol-literal note**: the Chinese section titles, field labels, separators, and short-tag forms shown in the code samples below (` — 依据(verified): `, ` — 原因: `, ` — 断点: `, `结论正文`, `一句话依据`, `一句话原因`, `推导与权衡`, `核心证据 (verified)`, `核心证据 (inferred)`, `重审条件`, `断点`, `(原立H001→推翻H003)`, `跳`, the four `##` section titles, etc.) are **exact L2 codec protocol literals**. They are part of the on-disk format and MUST be reproduced verbatim when generating or parsing — never translated in ledger content. English text around them is explanation only.
 
 ---
 
-## 1. `topics/<topic-id>.md` 顶层主题当前态账本
+## 1. `topics/<topic-id>.md` top-level current-state ledger
 
-### 1.1 frontmatter（7 字段）
+### 1.1 Frontmatter (7 fields)
 
 ```markdown
 ---
@@ -22,17 +24,17 @@ next_seq: {"C":4,"R":2,"Q":2,"A":4}
 ---
 ```
 
-| 字段 | 语义 |
+| Field | Semantics |
 | --- | --- |
-| `schema_version` | 恒 `1`；>1 触发版本守卫 |
-| `topic_id` | 创建后不可变，`^[a-z0-9][a-z0-9-]{0,63}$`；必须与文件名一致（不一致 = 篡改） |
-| `title` | 显示标题，支持任意语言，任意一次 `td save` 可改（载荷传 `title` 非空即更新） |
-| `head_hop` | 当前头跳号（`H004`） |
-| `updated_at` | 唯一来源 = head 跳头 `created_at`（amend 刷新之，冷重建同口径） |
-| `last_actor` | head 跳 `actor` |
-| `next_seq` | 各轨道**已用最大编号**（存储语义，见 §4 水位线），如 `{"C":4,"R":2,"Q":2,"A":4}` |
+| `schema_version` | Always `1`; `>1` triggers the version guard |
+| `topic_id` | Immutable after creation, `^[a-z0-9][a-z0-9-]{0,63}$`; must match the file name (a mismatch = tampering) |
+| `title` | Display title, any language, changeable in any `td save` (a non-empty `title` in the payload updates it) |
+| `head_hop` | Current head hop id (`H004`) |
+| `updated_at` | Sole source = head hop header `created_at` (refreshed by `--amend`, same rule on cold rebuild) |
+| `last_actor` | Head hop `actor` |
+| `next_seq` | **Largest number already used** per track (storage semantics, see §4 watermarks), e.g. `{"C":4,"R":2,"Q":2,"A":4}` |
 
-### 1.2 四个分节与条目行语法
+### 1.2 The four sections and item-line syntax
 
 ```markdown
 ## 1. 认知与定论 (Knowledge & Conclusions)
@@ -60,45 +62,45 @@ next_seq: {"C":4,"R":2,"Q":2,"A":4}
 - 待续焦点 (Next Focus): 拍板 `[Q1]` Webhook 鉴权边界并完成 `design.md` 落盘。
 ```
 
-- **条目行四段语法**（C/R/Q 压平单行）：`- [<topic_id>:<item_id>] <正文> — 依据(<verified|inferred>): <一句话依据>`；R 轨尾段为 ` — 原因: <一句话原因>`；A 轨带三态前缀 `- [x|~| ] [<topic_id>:<A n>] <正文> — 断点: <断点>`。内部换行压平为空格。
-- `## 4.` 最新一跳行内 `sha` = **hops.md_sha256 前 12 位**（hop 分片文件哈希，非 CAS 的 base_sha）；`parents` 仅示首父（多父合流详见 hop 头）。
+- **Item-line four-segment syntax** (C/R/Q flattened to one line): `- [<topic_id>:<item_id>] <body> — 依据(<verified|inferred>): <one-line basis>`; the R-track tail segment is ` — 原因: <one-line reason>`; the A track carries a three-state prefix `- [x|~| ] [<topic_id>:<A n>] <body> — 断点: <breakpoint>`. Internal newlines are flattened to spaces.
+- The `## 4.` latest-hop line's inline `sha` = **first 12 hex of `hops.md_sha256`** (the hop shard file hash — not the CAS `base_sha`); `parents` shows only the first parent (multi-parent consolidation details live in the hop header).
 
-### 1.3 单行分隔符消歧与转义
+### 1.3 Single-line separator disambiguation and escaping
 
-- 正文内字面量 ` — 依据(`、` — 原因:`、` — 断点:` 或行尾形如 `(H001)` 的括号，渲染时自动将破折号转义为 `&#8212;`、左括号转义为 `&#40;`；解析时**从右侧匹配最后一个标准分隔符**并还原转义，保证 `parse(render(doc)) == doc`。
+- If the body contains a literal ` — 依据(`, ` — 原因:`, ` — 断点:`, or a trailing parenthetical shaped like `(H001)`, rendering escapes the em dash as `&#8212;` and the left paren as `&#40;`; parsing matches the **last standard separator from the right** and restores the escapes, guaranteeing `parse(render(doc)) == doc`.
 
 ---
 
-## 2. 行尾短标（`<auto_trace_tag>`，全形态 ≤20 字符 / UTF-8 ≤32 B）
+## 2. Trailing short-tag (`<auto_trace_tag>`, all forms <=20 chars / UTF-8 <=32 B)
 
-### 2.1 基本形态
+### 2.1 Basic forms
 
-对 `[C<n>]` 与 `[A<n>]`：从 `item_hops` 按 `seq_order` 正序取全部关联跳号 `[h1..hm]`：
+For `[C<n>]` and `[A<n>]`: take all associated hop ids `[h1..hm]` from `item_hops` in `seq_order` order:
 
 - `m = 1` → `(H001)`
-- `2 ≤ m ≤ 3` → `(H001→H003→H005)`
-- `m > 3` → 折叠中间项 `(H001→..→H012, 6跳)`
+- `2 <= m <= 3` → `(H001→H003→H005)`
+- `m > 3` → middle hops folded `(H001→..→H012, 6跳)`
 
-对 `[R<n>]`：直接新建排除项同上；由原结论 `[C<k>]` 推翻移入时标 `(原立<origin_hop>→推翻<overturn_hop>)`（`origin_hop` 固定为该原结论首次创建的跳号，即 `seq_order=1`）。
+For `[R<n>]`: a directly created rejected item follows the C/A forms above; one moved in by overturning an original conclusion `[C<k>]` is tagged `(原立<origin_hop>→推翻<overturn_hop>)` (where `origin_hop` is fixed to the hop id where the original conclusion was first created, i.e. `seq_order=1`).
 
-### 2.2 全形态降级链（D-P30/D4）
+### 2.2 Full-form downgrade chain (D-P30/D4)
 
-降级链适用于**全部形态**（m=1/2/3、m>3、R 轨）；超 20 字符或 32 字节时依序降级：
+The downgrade chain applies to **all forms** (m=1/2/3, m>3, R track); beyond 20 chars or 32 bytes it degrades in this order:
 
-- 普通与折叠形态：`(H1000→..→H1012, 6跳)` → `(H1000..+6跳)` → `(H1000)` → 确定性截断兜底（取前 18 字符 + `)`），硬上限恒成立。
-- R 轨形态：`(原立H1001→推翻H1003)` → `(推翻H1003)` → 确定性截断兜底。
+- Plain and folded forms: `(H1000→..→H1012, 6跳)` → `(H1000..+6跳)` → `(H1000)` → deterministic truncation fallback (first 18 chars + `)`), hard cap always holds.
+- R-track form: `(原立H1001→推翻H1003)` → `(推翻H1003)` → deterministic truncation fallback.
 
-跳号 ≥3 位补零、自然增长（`H999→H1000`）、比较按数值。
+Hop ids are zero-padded to >=3 digits and grow naturally (`H999→H1000`); comparisons are numeric.
 
 ---
 
-## 3. `hops/hop-NNN.md` 历史增量分片
+## 3. `hops/hop-NNN.md` historical incremental hop shard
 
-### 3.1 第 1 行安全 JSON 注释头（canonical）
+### 3.1 First-line safe JSON comment header (canonical)
 
-第 1 行固定：`<!-- topicdock-hop: <canonical-json> -->`——`json.dumps(header, ensure_ascii=False, sort_keys=True)` 紧凑单行；转义顺序**先** `--` → `-\u002d`，**再** `<` → `\u003c`、`>` → `\u003e`（防注释截断与 HTML 注入；摘要含 `-->` 时不会截断注释头）。
+The first line is always: `<!-- topicdock-hop: <canonical-json> -->` — `json.dumps(header, ensure_ascii=False, sort_keys=True)` on one compact line; escaping order is **first** `--` → `-\u002d`, **then** `<` → `\u003c`, `>` → `\u003e` (prevents comment truncation and HTML injection; a summary containing `-->` never truncates the header).
 
-**必填字段集（11 个，含 `title` 与 `artifacts` 快照，保障重放修复与冷重建 100% 无损）**：
+**Required base field set (11 fields, including the `title` and `artifacts` snapshots, guaranteeing 100% lossless replay repair and cold rebuild)**:
 
 ```json
 {
@@ -117,30 +119,46 @@ next_seq: {"C":4,"R":2,"Q":2,"A":4}
 }
 ```
 
-- **可选溯源字段 `model`**（`v: 1` 前向兼容可选键）：记录本跳所用模型标识，`actor` 仅记录操作主体、不再拼接 `@<model>` 后缀。
-  - 仅当 `td save` 载荷 `"model"`（或 `td merge --model`）为非空字符串（`strip()` 后非空）时写入跳头；未传、`null` 或空白串视为缺省，**不写入 `"model"` 键**（老跳与无 `model` 保存的字节与 `sha256` 不变）。传入非 `None` 且非 `str` 类型 → `INVALID_INPUT`（退出码 7）。
-  - 新建跳（首次建档、常规新跳、降级新跳、`--fork-as`、`--force-merge`、`td merge`）不继承父跳 `model`；同跳 `--amend` 传入非空串时更新，缺省/空白保留原值。
-  - `model` 仅存于本行 JSON 注释头：不修改 `topics/<id>.md` 的 `## 4.` 行，也不新增 SQLite 列。
-- 解析**保留任意额外字段**、渲染**原样透传**（前向兼容）。
-- 头部第 2 行起为 `# Hop H003 — auth-refactor` 标题行。
+- **Optional provenance field `model`** (a `v: 1` forward-compatible optional key): records the model identifier used for this hop; `actor` records only the acting principal and no longer appends an `@<model>` suffix.
+  - Written only when the `td save` payload `"model"` (or `td merge --model`) is a non-empty string (non-empty after `strip()`); missing / `null` / whitespace-only counts as absent and **the `"model"` key is not written** (legacy hops and saves without `model` keep identical bytes and `sha256`). A non-`None`, non-`str` value → `INVALID_INPUT` (exit code 7).
+  - Newly created hops (first topic creation, regular new hop, degraded new hop, `--fork-as`, `--force-merge`, `td merge`) do not inherit the parent hop's `model`; on same-hop `--amend`, a non-empty string updates it, while absent/whitespace keeps the existing value.
+  - `model` lives only in this JSON comment header line: it never modifies the `topics/<id>.md` `## 4.` line and adds no SQLite column.
+- Parsing **preserves any extra fields** and rendering **passes them through verbatim** (forward compatibility).
+- From the second line the header is followed by the `# Hop H003 — auth-refactor` title line.
 
-### 3.2 `title` / `artifacts` 快照流转（D-P33）
+#### 3.1.1 The 4 position-independent Merkle identity fields (`v: 1` forward-compatible optional extension, D8)
 
-- ① `td save` 载荷省略 `artifacts`（或 `null`）→ 继承 `base_hop` 头快照；显式 `[]` → 清空；传入新列表 → 更新并**自动剔除已销毁死链**。
-- ② `td merge <src> <dst>` 合流跳：`artifacts` 取 dst 与 src 最新跳快照的并集（**按 `path` 保序去重**）；`title` 取 dst。
-- ③ 篡改修复、冷重建（`doctor --rebuild`）及从历史祖先跳 `--fork-as` 分叉：直接从目标跳头 `title` 与 `artifacts` 100% 还原主题标题与 `## 3. 关联文件链接`。
+Hop header fields are strictly decoupled into "store-local routing slots" (`hop_id`, `parents`, `topic_origin`, and the per-block `origin` attribute — rewritable on cross-store import collisions) and "global position-independent Merkle identity" (100% invariant across cross-store renumbering and collision renames). All 6 hop-writing entry points (`_save_new_topic`, `_save_amend`, `_save_fork`, regular `_save_locked`, `_save_force_merge`, `_merge_payload`) route through the single finalizer `_finalize_hop_merkle_header(store, conn, topic_id, header, blocks, chain, rep)`, which writes:
 
-### 3.3 条目块标题行属性语法
+1. **`topic_uid`** (`str`, 32-hex topic lineage id): `uuid.uuid4().hex` on first topic creation (`base_hop: null`) or branch fork (`--fork-as <new_id>`); `td merge <src> <dst>` takes the destination `<dst>`'s `topic_uid`. Regular new hops, `--amend`, and `--force-merge` inherit the most recent non-empty `str` `topic_uid` found along the reachable own chain (walking from `base_hop` toward genesis; on a head break, surviving shards with `topic_origin == topic_id` are scanned in descending hop-number order). Only when the entire reachable own chain consists of legacy hops without `topic_uid` is it deterministically derived from the reachable earliest hop `H_earliest` as `sha256(b"topicdock-topic-uid:v1\0" + compute_hop_oid(H_earliest).encode("utf-8")).hexdigest()[:32]` (on `--amend` of a legacy head, extraction/derivation happens **before** `created_at / summary / blocks` are modified).
+2. **`parent_oids`** (`list[str]`, aligned 1:1 by index with `parents`): for each parent hop `P_i`, always the **live-recomputed** `compute_hop_oid(parent_loaded.hop)` (never a possibly stale cached value); when the parent file is missing on disk (D-P20) the slot is `""` to preserve index alignment; a genesis hop is `[]`.
+3. **`origin_oids`** (`dict[str, str]`, optional — the key is written only when this hop's `blocks` contain a non-empty `block.origin`; omitted entirely when empty): `{ "<block.item_id>": "<src_topic_uid>:<src_item_id>@<origin_hop_oid>" }`, resolved via `_parse_origin(block.origin)`; a source store without a persisted `topic_uid` gets a `""` slot (foreign topics are never filled with a derived value); a missing source hop (D-P20) gets `""` in the `origin_hop_oid` slot.
+4. **`hop_oid`** (`str`, format `"v1:<64-hex>"` — position-independent pure-function content hash): computed last, over the finalized header + blocks.
+
+**`compute_hop_oid(hop: HopDoc) -> str` (L2 pure function, one non-recursive implementation shared by legacy and new hops)**:
+- First normalize via `norm_hop = parse_hop_md(render_hop_md(hop))`, then build a **fixed 13-key dictionary** (all top-level keys always present; missing/abnormal values become safe empties `"" / [] / {}`): `v` (int, default 1), `topic_uid`, `title`, `parent_oids`, `session_id`, `created_at`, `actor`, `model` (only non-empty strings, stripped), `summary`, `next_focus`, `artifacts` (list of dicts with `name`/`path`/`note` all stringified), `origin_oids` (`sorted` then `{str: str}`), and `blocks` (in `norm_hop.blocks` order; each block a fixed 7-key dict `item_id / op / status / a_state / from_items / origin_item / fields`, with `origin_item` = `_parse_origin(b.origin)[1]` or `""`, and `fields` stringified in `_HOP_FIELD_ORDER` intersection order).
+- Then `json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")`, prefixed with the domain separator `b"topicdock-hop-oid:v1\0"`, hashed with SHA-256, returned as `"v1:" + hex`.
+- **Position-independence guarantee**: the store-local slots `hop_id`, `parents`, `topic_origin`, the full local `origin` string on blocks, and `hop_oid` itself are excluded from the 13 keys (while the block-level source item id `origin_item` and the top-level `origin_oids` are included), so `compute_hop_oid(hop)` is 100% invariant across cross-store `HNNN` renumbering or collision renames.
+
+**`_load_hop` non-destructive tolerance**: a hop file with any of the 4 fields missing, type-abnormal (e.g. externally written `null`), or with `header["hop_oid"] != compute_hop_oid(hop)` (e.g. a pre-D8 legacy client amending in place without refreshing `hop_oid`) is **never rejected**; the read side safely normalizes to `"" / [] / {}`. When `file_sha256 == db.hops.md_sha256` (i.e. the file passed tamper verification) but the header `hop_oid` disagrees, the live-recomputed `compute_hop_oid(hop)` is the single authority; `td doctor` reports it non-destructively as `hop_oid_drift`. Legacy hops are never rewritten in the background (zero disk churn).
+
+### 3.2 `title` / `artifacts` snapshot flow (D-P33)
+
+- (1) A `td save` payload that omits `artifacts` (or passes `null`) inherits the `base_hop` header snapshot; an explicit `[]` clears it; a new list updates it and **automatically prunes destroyed dead links**.
+- (2) A `td merge <src> <dst>` consolidation hop: `artifacts` is the union of the dst and src latest-hop snapshots (**deduplicated by `path`, order-preserving**); `title` is taken from dst.
+- (3) Tamper repair, cold rebuild (`doctor --rebuild`), and forking from a historical ancestor hop via `--fork-as`: the topic title and `## 3. 关联文件链接` are restored 100% from the target hop header's `title` and `artifacts`.
+
+### 3.3 Item block title attribute syntax
 
 ```
 ### [<item_id>] (op=<op>[, status=verified|inferred][, state=x|~|space][, from=<id1>+<id2>][, origin=<topic>:<item>@<hop>])
 ```
 
-- `op ∈ {create, update, overturn, resolve, fold, inherit, retract}`（7 种）；多来源 ID 用 `+` 连接（如 `from=A1+A2+A3`）；`origin` 承载推翻/解决/继承的来源条目初始创建跳。
-- **块字段 = 操作后完整条目快照**（`update` 含全量 post-state 字段，非增量）：`结论正文` / `一句话依据`（R 轨为 `一句话原因`、A 轨为 `断点`）/ `推导与权衡` / `核心证据 (verified|inferred)` / `重审条件`。
-- 块内多行字段**续行统一缩进 2 个空格**；字段内容某行以 `### [` 开头时渲染转义为 `\### [`（防冷重建误切分为新条目块）。
+- `op ∈ {create, update, overturn, resolve, fold, inherit, retract}` (7 kinds); multiple source ids are joined with `+` (e.g. `from=A1+A2+A3`); `origin` carries the initial creation hop of the source item for overturn/resolve/inherit.
+- **Block fields = the full post-operation item snapshot** (`update` carries the full post-state fields, not a delta). The field labels are exact protocol literals: `结论正文` / `一句话依据` (R track: `一句话原因`; A track: `断点`) / `推导与权衡` / `核心证据 (verified)` / `核心证据 (inferred)` / `重审条件` — 8 Chinese field names in total.
+- Continuation lines of a multi-line field are **uniformly indented by 2 spaces**; a line starting with `### [` is escaped to `\### [` when rendered (prevents cold-rebuild mis-splitting into a new item block).
 
-完整 hop 示例（与 design §4.2(3) 一致）：
+Full hop example (consistent with design §4.2(3)):
 
 ```markdown
 <!-- topicdock-hop: {"actor":"consultant","artifacts":[{"name":"网关架构设计记录","note":"定义 JWT 载荷字段与公钥轮换接口","path":"/abs/path/to/design.md"}],"created_at":"2026-11-16T09:15:00Z","hop_id":"H003","model":"opencode/claude-sonnet-5-5","next_focus":"设计 Refresh Token 吊销机制","parents":["H002"],"session_id":"ses-01","summary":"基于跨区压测推翻 H001 的共享 Session 方案(C1->R1)，确立 EdDSA 短效 JWT(C2)","title":"認證模塊無狀態 JWT 改造與灰度遷移 / Auth Stateless JWT Refactor","topic_origin":"auth-refactor","v":1} -->
@@ -158,33 +176,43 @@ next_seq: {"C":4,"R":2,"Q":2,"A":4}
 
 ---
 
-## 4. 编号水位线（单调防重用不变量）
+## 4. Numbering watermarks (monotonic no-reuse invariants)
 
-### 4.1 全局跳号水位线（D-P30 四源 max）
+### 4.1 Global hop-number watermark (D-P30 four-source max)
 
 ```
 next_hop_seq = max(db.meta.next_hop_seq, .topicdock-meta.max_hop_seq + 1,
-                   max(hop 文件编号) + 1, max(topics.head_hop 编号) + 1)
+                   max(hop file numbers) + 1, max(topics.head_hop numbers) + 1)
 ```
 
-每次分配新跳时同步更新 `.topicdock-meta.json`；分配号一律走引擎内 `allocate_hop_id`，禁止旁路。
+`.topicdock-meta.json` is updated whenever a new hop id is allocated; allocation always goes through the engine's `allocate_hop_id` — bypassing it is forbidden.
 
-### 4.2 主题内各轨道编号水位线（D-P30 三源 max）
+### 4.2 Per-track numbering watermark inside a topic (D-P30 three-source max)
 
 ```
 next_seq[T] = max(frontmatter.next_seq[T], max(topic.md(T)) + 1, max(item_hops(T)) + 1)
 ```
 
-**存储语义**：md frontmatter 与 DB `topics.next_seq_json` 存的是**「已用最大号」**（非 +1 语义的下一号）；分配时由引擎按上式取 max 后再 +1，分配结果严禁写回 md 当水位（否则崩溃纳管的 `md == render` 门禁会拒收合法窗口 md）。
+**Storage semantics**: the md frontmatter and the DB `topics.next_seq_json` store the **largest number already used** (not the +1 "next number"); on allocation the engine takes the max of the above and then +1, and the allocated result must never be written back into the md as a watermark (otherwise the crash-adoption `md == render` gate would reject a legitimately in-window md).
 
-### 4.3 undo 后 md 高水位语义
+### 4.3 Post-undo md high-watermark semantics
 
-`td undo` 绝对还原恢复旧 md 时，仅对**本次实际恢复的 md** 将 frontmatter `next_seq` 强制覆写为 `max(还原值, 撤前已用最大 + 1)`——被撤回条目的编号永不复用；旁观主题不受影响（不传染）。merge 续编与 save 重放基座同样套 md frontmatter 水位 floor（撤号不复用、md 水位不回退）。
+When `td undo` restores an old md, only the **actually restored md** has its frontmatter `next_seq` forcibly overwritten to `max(restored value, largest number used before the undo + 1)` — the number of a retracted item is never reused; bystander topics are unaffected (no contagion). Merge renumbering and the save replay base apply the same md frontmatter watermark floor (no number reuse, md watermark never regresses).
 
 ---
 
-## 5. 已知边界（设计已确认的不改代码残余）
+## 5. Store housekeeping files
 
-- **F8（undo 后 next_seq 极端场景）**：undo 后的高水位仅存于 md frontmatter 与 DB topics 行——若 DB **同时**损坏且从 hops 链重放（冷重建），已撤回条目的编号可能被复用；属可接受极端场景，不追加防御。
-- **F13 残余**：① `MISSING` hop 还原后 sha ≠ `MISSING` 会按失配进入下一轮判定（先按损坏路径处置，收敛正确但多一轮）；② 「提交后、删文件前崩溃」由 ③ 崩溃纳管 + ⑤ DB 闭包同轮再级联闭环收敛（无独立 undo 条目为已接受损失）；③ 版本守卫每命令全量扫 md/hop 文件有额外读盘开销；④ heal 主体中途 `DatabaseError` 无重建重试兜底；⑤ `quick_check` 失败分支无专测。
-- **M7（F15）残余**：① undo journal 的启动 heal 接线未实现——入口拒绝（journal 残留时 undo 报 `INVALID_INPUT` 退出码 7，需手动删 `.topicdock-undo-pending.json`）已把无消费者窗口收窄到进程内崩溃；② 无参 doctor 对健康库仅报 `meta_json: ok` 一项（非全维 ok 项展开）；③ undo 棘轮使被撤轨道编号产生 +1 空洞（永不复用语义的代价，可接受）；④ delete undo payload 对乱码文件预像用 bytes/base64 编码落库，`json.dumps(ensure_ascii=False)` 文本列在极端场景可能不可读（F13 同源记录）。
+- `.topicdock-meta.json` — persisted watermark `{"schema_version": 1, "max_hop_seq": N}`.
+- `.topicdock.lock` — cross-platform exclusive/shared file lock (POSIX `flock` / Windows `msvcrt`).
+- `.topicdock-undo-pending.json` / `.topicdock-amend-pending.json` — crash-window journals (removed after their transaction commits).
+- **`.topicdock-published.json` — publish seal ledger (D8)**: records hop oids that have been exported/synced, as `{"v": 1, "published_oids": ["v1:<64-hex>", ...]}`. Publishing seals a hop without rewriting any `hop-NNN.md` byte (0 cross-window CAS false conflicts). Reading is fail-closed: a missing file is `(set(), False)`; any parse/shape failure is `(set(), True)`. A sealed head's `--amend` auto-degrades to a new next hop, and `td undo` on a sealed hop — or while the ledger is corrupt — always reports `UNDO_BLOCKED` (exit code 7), which `--force` cannot bypass. The ledger is listed in the store `.gitignore` as machine-local state and is preserved by `doctor --rebuild`.
+- `.gitignore` — written by `td init` with exactly these lines: `topicdock.db*`, `.topicdock.lock`, `*.tmp`, `.topicdock-undo-pending.json`, `.topicdock-amend-pending.json`, `.topicdock-published.json`.
+
+---
+
+## 6. Known boundaries (design-confirmed residuals, no code change planned)
+
+- **F8 (extreme post-undo `next_seq` scenario)**: the post-undo high watermark lives only in the md frontmatter and the DB topics row — if the DB is **also** corrupted and replayed from the hop chain (cold rebuild), a retracted item's number may be reused; an acceptable extreme, no extra defense added.
+- **F13 residuals**: (1) after a `MISSING` hop is restored, `sha != MISSING` enters the next judging round (handled via the corruption path — converges correctly, one extra round); (2) a crash between "commit and file deletion" is closed by crash adoption (3) plus DB closure (5) in the same round (no dedicated undo entry — accepted loss); (3) the version guard scans all md/hop files on every command (extra I/O); (4) the heal main path has no rebuild retry when it hits `DatabaseError` mid-way; (5) the `quick_check` failure branch has no dedicated test.
+- **M7 (F15) residuals**: (1) startup heal wiring for the undo journal is not implemented — entry rejection (undo reports `INVALID_INPUT` exit 7 while `.topicdock-undo-pending.json` remains; delete the file manually) narrows the un-consumed window to an in-process crash; (2) a no-arg `doctor` on a healthy store reports only `meta_json: ok` (plus the M2 additions `published_ledger` and `hop_oid_drift`, both `ok`); (3) the undo ratchet leaves a +1 hole in retracted track numbers (the price of never-reuse semantics, accepted); (4) the delete-undo payload encodes garbage-file pre-images as base64 bytes, so `json.dumps(ensure_ascii=False)` into a text column may be unreadable in extreme cases (same origin as F13).

@@ -70,40 +70,48 @@ EXIT_UNWRITABLE = 1
 EXIT_USAGE = 2
 
 _EXIT_CODE_LINE = (
-    "td 退出码: 0=OK / 1=ERROR / 2=用法错误 / 3=UNINITIALIZED_STORE / "
-    "4=STALE_BASE / 5=NOT_FOUND / 6=SCHEMA_VERSION / 7=INVALID_INPUT(含 UNDO_BLOCKED)"
+    "td exit codes: 0=OK / 1=ERROR / 2=USAGE_ERROR / 3=UNINITIALIZED_STORE / "
+    "4=STALE_BASE / 5=NOT_FOUND / 6=SCHEMA_VERSION / 7=INVALID_INPUT(incl. UNDO_BLOCKED)"
 )
 
 
 def _wakeup_rules() -> list[str]:
-    """从 SKILL.md 提取 3 行常驻唤醒守则（单一事实源，避免与守则块漂移）。"""
+    """Extract the 3 resident wakeup rules from SKILL.md (single source of truth)."""
     try:
         text = _SKILL_MD.read_text(encoding="utf-8")
-    except OSError:
-        return []
+    except OSError as exc:
+        raise SystemExit(
+            f"Cannot read {_SKILL_MD}: {exc}; cannot extract the 3 resident wakeup rules."
+        ) from exc
+    prefixes = (
+        "- **TopicDock Read (Mount)**:",
+        "- **TopicDock Trace (Lineage)**:",
+        "- **TopicDock Write (Distill)**:",
+    )
     rules = []
     for line in text.splitlines():
-        if line.startswith("- **TopicDock 调取（Read）**") or line.startswith(
-            "- **TopicDock 追根（Trace）**"
-        ) or line.startswith("- **TopicDock 沉淀（Write）**"):
+        if line.startswith(prefixes):
             rules.append(line)
+    if len(rules) != 3:
+        raise SystemExit(
+            f"Failed to extract exactly 3 resident wakeup rules from {_SKILL_MD} "
+            f"(found {len(rules)}); check the anchor prefixes."
+        )
     return rules
 
 
 def _guideline_block(engine_path: Path) -> str:
-    """守则块全文：3 行唤醒守则 + 一行 td 调用提示 + 一行退出码表。"""
+    """Full guideline block: 3 wakeup rules + one td invoke line + one exit-code line."""
     rules = _wakeup_rules()
-    if not rules:
-        raise SystemExit(f"无法从 {_SKILL_MD} 提取 3 行唤醒守则")
     lines = [
         SENTINEL_BEGIN,
-        "## TopicDock 常驻唤醒守则（由 scripts/install.py 自动注入/更新，勿手改本块）",
+        "## TopicDock Resident Rules (auto-injected by scripts/install.py; do not edit manually)",
         *rules,
         (
-            f"- **调用**：`python3 {engine_path} <子命令> …`（已建别名 `td`）；"
-            "11 子命令与载荷/输出契约见技能目录 references/cli-contract.md。"
+            f"- **Invoke**: `python3 {engine_path} <subcommand> …` (alias `td`); "
+            "see skill `references/cli-contract.md` for the 11 subcommands and JSON payload/output contracts."
         ),
-        f"- **退出码**：{_EXIT_CODE_LINE}",
+        f"- **Exit codes**: {_EXIT_CODE_LINE}",
         SENTINEL_END,
     ]
     return "\n".join(lines) + "\n"
@@ -401,16 +409,16 @@ def _selected(client: str) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="install",
-        description="TopicDock 跨客户端 Skill 安装/卸载（claude|opencode|cursor|codex|all）",
+        description="TopicDock cross-client Skill installer/uninstaller (claude|opencode|cursor|codex|all)",
     )
     parser.add_argument(
-        "--client", required=True, choices=(*CLIENTS, "all"), help="目标客户端"
+        "--client", required=True, choices=(*CLIENTS, "all"), help="target client"
     )
     parser.add_argument(
         "--dest", default=None,
-        help="覆盖 skills 根目录（目标仍为 <dest>/topicdock）与命令模板根（<dest>/<client>/commands）",
+        help="override the skills root (target still <dest>/topicdock) and the command-template root (<dest>/<client>/commands)",
     )
-    parser.add_argument("--uninstall", action="store_true", help="反向清理")
+    parser.add_argument("--uninstall", action="store_true", help="reverse cleanup")
     args = parser.parse_args(argv)
     try:
         code, notes = uninstall(args) if args.uninstall else install(args)

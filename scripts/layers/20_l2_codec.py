@@ -534,6 +534,104 @@ def parse_hop_md(text: str) -> HopDoc:
     return hop
 
 
+# ---------- 位置无关 Merkle 身份（D8） ----------
+
+def _parse_origin(origin: str | None) -> tuple[str, str, str] | None:
+    """解析 origin 属性 `<topic>:<item>@<hop>`；非法/缺失 → None。"""
+    if not origin:
+        return None
+    match = re.fullmatch(r"([A-Za-z0-9-]+):([CRQA]\d+)@(H\d+)", str(origin))
+    if match is None:
+        return None
+    return match.group(1), match.group(2), match.group(3)
+
+
+def compute_hop_oid(hop: HopDoc) -> str:
+    """位置无关 Merkle 内容哈希（design §4.2(3)）：固定 13 键 + 域分隔 SHA-256。
+
+    局部路由槽位（hop_id / parents / topic_origin / block.origin / hop_oid）不入键，
+    跨库重编号或撞名改名后恒等；先经 render/parse 归一化以保证与存量旧跳同口径。
+    """
+    norm_hop = parse_hop_md(render_hop_md(hop))
+    header = norm_hop.header
+    try:
+        version = int(header.get("v", 1))
+    except (TypeError, ValueError):
+        version = 1
+    topic_uid = header.get("topic_uid")
+    if not isinstance(topic_uid, str):
+        topic_uid = ""
+    parent_oids_raw = header.get("parent_oids")
+    parent_oids = (
+        [str(x) for x in parent_oids_raw]
+        if isinstance(parent_oids_raw, list) else []
+    )
+    model = header.get("model")
+    model = model.strip() if isinstance(model, str) else ""
+    artifacts = [
+        {
+            "name": str(artifact.get("name", "")),
+            "path": str(artifact.get("path", "")),
+            "note": str(artifact.get("note", "") or ""),
+        }
+        for artifact in (header.get("artifacts") or [])
+        if isinstance(artifact, dict)
+    ]
+    origin_oids_raw = header.get("origin_oids")
+    if isinstance(origin_oids_raw, dict):
+        origin_oids = {
+            key: value
+            for key, value in sorted(
+                (str(k), str(v)) for k, v in origin_oids_raw.items()
+            )
+        }
+    else:
+        origin_oids = {}
+
+    blocks = []
+    for block in norm_hop.blocks:
+        if block.a_state is None:
+            a_state = None
+        elif block.a_state in (" ", "space"):
+            a_state = " "
+        else:
+            a_state = str(block.a_state)
+        parsed_origin = _parse_origin(block.origin)
+        blocks.append({
+            "item_id": str(block.item_id),
+            "op": str(block.op),
+            "status": str(block.status) if block.status else None,
+            "a_state": a_state,
+            "from_items": [str(x) for x in (block.from_items or [])],
+            "origin_item": parsed_origin[1] if parsed_origin else "",
+            "fields": {
+                name: str(block.fields[name])
+                for name in _HOP_FIELD_ORDER if name in block.fields
+            },
+        })
+
+    payload = {
+        "v": version,
+        "topic_uid": topic_uid,
+        "title": str(header.get("title", "")),
+        "parent_oids": parent_oids,
+        "session_id": str(header.get("session_id", "")),
+        "created_at": str(header.get("created_at", "")),
+        "actor": str(header.get("actor", "")),
+        "model": model,
+        "summary": str(header.get("summary", "")),
+        "next_focus": str(header.get("next_focus", "")),
+        "artifacts": artifacts,
+        "origin_oids": origin_oids,
+        "blocks": blocks,
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    digest = hashlib.sha256(b"topicdock-hop-oid:v1\0" + encoded).hexdigest()
+    return "v1:" + digest
+
+
 # ---------- 共享重放内核（D-P22） ----------
 
 def _track_of(item_id: str) -> str:

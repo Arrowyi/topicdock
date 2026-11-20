@@ -13,6 +13,71 @@ _HOP_FILE_RE = re.compile(r"^hop-(\d+)\.md$")
 _TOPIC_FILE_RE = re.compile(r"^([a-z0-9][a-z0-9-]{0,63})\.md$")
 
 _AMEND_PENDING_NAME = ".topicdock-amend-pending.json"
+_PUBLISHED_LEDGER_NAME = ".topicdock-published.json"
+
+# 版本守卫短读上限：远超任何合法 frontmatter，防上限误伤真实高版本文件。
+_SCHEMA_HEADER_SCAN_LIMIT = 64 * 1024
+_SCHEMA_SCAN_CHUNK = 8192
+_UNIVERSAL_LINE_RE = re.compile(rb"\r\n|\r|\n")
+
+
+# ---------- 独立本地封板台账（design §2.3，D8） ----------
+
+def read_published_oids(store: StoreContext) -> tuple[set[str], bool]:
+    """读封板台账：返回 (已封板 oid 集, is_corrupt)。
+
+    - 文件缺失 → `(set(), False)`（无封板记录，不触发失败关闭）；
+    - 其它读取失败（目录占位、权限不足等）/ JSON 语法损坏 / `v != 1` /
+      `published_oids` 非字符串列表 → `(set(), True)`，调用方须按失败关闭处理
+      （拒绝原地 amend 与一切 undo）。
+    """
+    path = store.root / _PUBLISHED_LEDGER_NAME
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set(), False
+    except (OSError, ValueError):
+        return set(), True
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return set(), True
+    if not isinstance(data, dict):
+        return set(), True
+    version = data.get("v")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        return set(), True
+    raw = data.get("published_oids")
+    if not isinstance(raw, list) or any(not isinstance(oid, str) for oid in raw):
+        return set(), True
+    return set(raw), False
+
+
+def mark_published_oids(store: StoreContext, oids) -> None:
+    """把 `oids` 并入封板台账并原子落盘 `{"v": 1, "published_oids": sorted([...])}`。
+
+    锁约定：调用方必须已持 `store.exclusive_lock()`；本函数内部不再加锁。
+    无 CLI 暴露（供未来 export/sync 与测试直调）。
+
+    失败关闭：台账已损坏（`is_corrupt == True`）时**拒绝覆写**并抛 `InvalidInput`，
+    原台账字节保持不变——绝不静默遗忘既有封板记录。
+    """
+    existing, is_corrupt = read_published_oids(store)
+    if is_corrupt:
+        raise InvalidInput(
+            "封板台账损坏（失败关闭）：拒绝覆写，请先人工修复或删除该台账"
+        )
+    merged = set(existing)
+    merged.update(str(oid) for oid in oids)
+    atomic_write_text(
+        store.root / _PUBLISHED_LEDGER_NAME,
+        json.dumps(
+            {"v": 1, "published_oids": sorted(merged)},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+    )
 
 
 def _md_frontmatter(text: str) -> str:
@@ -26,19 +91,61 @@ def _md_frontmatter(text: str) -> str:
     return ""
 
 
+def _read_md_frontmatter_head(path: Path) -> str | None:
+    """增量读 topic md 至 frontmatter 闭合 `---`（字节上限 64 KiB）。
+
+    返回 frontmatter 文本；无 frontmatter 或未在字节上限内闭合 → `""`（不判定）；
+    读失败 / 非 UTF-8 → `None`（不判定，交七步处置）。
+    """
+    try:
+        handle = path.open("rb")
+    except OSError:
+        return None
+    with handle:
+        buf = b""
+        closed_at = -1
+        while len(buf) < _SCHEMA_HEADER_SCAN_LIMIT:
+            chunk = handle.read(
+                min(_SCHEMA_SCAN_CHUNK, _SCHEMA_HEADER_SCAN_LIMIT - len(buf))
+            )
+            if not chunk:
+                break
+            buf += chunk
+            lines = _UNIVERSAL_LINE_RE.split(buf)
+            if not lines or lines[0].strip() != b"---":
+                return ""  # 无 frontmatter
+            for index in range(1, len(lines)):
+                if lines[index].strip() == b"---":
+                    closed_at = index
+                    break
+            if closed_at >= 0:
+                break
+    lines = _UNIVERSAL_LINE_RE.split(buf)
+    if not buf or not lines or lines[0].strip() != b"---":
+        return ""
+    if closed_at < 0:
+        return ""  # 未在字节上限内闭合：维持现语义不判定
+    head = b"\n".join(lines[: closed_at + 1])
+    try:
+        text = head.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return _md_frontmatter(text)
+
+
 def _raise_on_newer_schema(store: StoreContext) -> None:
     """版本守卫前置（design §4.2(1)）：任一 md/hop 高于本引擎版本 → 抛
     UnsupportedSchemaVersion；在任何写盘/删盘之前执行，杜绝旧引擎自愈销毁
     新版本数据。文件头读失败（损坏/乱码）不作判定，交七步处置。
     只扫 frontmatter/注释头区间——正文行不参与判定（正文含
-    `schema_version: 2` 不得锁死全库）。"""
+    `schema_version: 2` 不得锁死全库）；topic 增量读至 frontmatter 闭合，
+    hop 仅读首行。"""
     for md_path in sorted(store.topics_dir.glob("*.md")):
-        try:
-            text = md_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        frontmatter = _read_md_frontmatter_head(md_path)
+        if not frontmatter:
             continue
         match = re.search(
-            r"^schema_version:\s*(\d+)\s*$", _md_frontmatter(text), re.MULTILINE
+            r"^schema_version:\s*(\d+)\s*$", frontmatter, re.MULTILINE
         )
         if match and int(match.group(1)) > SUPPORTED_SCHEMA_VERSION:
             raise UnsupportedSchemaVersion(
@@ -46,7 +153,8 @@ def _raise_on_newer_schema(store: StoreContext) -> None:
             )
     for hop_path in sorted(store.hops_dir.glob("hop-*.md")):
         try:
-            first_line = hop_path.read_text(encoding="utf-8").split("\n", 1)[0]
+            with hop_path.open("r", encoding="utf-8") as handle:
+                first_line = handle.readline().rstrip("\r\n")
         except (OSError, UnicodeDecodeError):
             continue
         if not (
@@ -92,15 +200,52 @@ class ReplayedChain:
     overturns: dict[str, tuple[str, str]] = field(default_factory=dict)  # R item -> (原立, 推翻)
 
 
-def _load_hop(store: StoreContext, hop_id: str) -> LoadedHop | None:
-    """加载并校验 hop 分片；缺失/不可解析/头失配/自环 parent → None（判损坏）。"""
-    if not re.fullmatch(r"H\d+", str(hop_id)):
+def _normalize_merkle_extension_header(header: dict) -> None:
+    """D8 读侧容错：4 扩展字段现值类型异常 → 安全空默认（不新增缺失键、不回写）。"""
+    if "topic_uid" in header and not isinstance(header["topic_uid"], str):
+        header["topic_uid"] = ""
+    if "parent_oids" in header:
+        raw = header["parent_oids"]
+        header["parent_oids"] = (
+            [str(x) for x in raw] if isinstance(raw, list) else []
+        )
+    if "origin_oids" in header:
+        raw = header["origin_oids"]
+        header["origin_oids"] = (
+            {str(k): str(v) for k, v in raw.items()}
+            if isinstance(raw, dict) else {}
+        )
+    if "hop_oid" in header and not isinstance(header["hop_oid"], str):
+        header["hop_oid"] = ""
+
+
+def _load_hop(
+    store: StoreContext, hop_id: str, cache: dict[str, LoadedHop | None] | None = None
+) -> LoadedHop | None:
+    """加载并校验 hop 分片；缺失/不可解析/头失配/自环 parent → None（判损坏）。
+
+    `cache` 为单次命令调用内的 `hop_id -> LoadedHop|None` 缓存（trace 批量追根
+    共享，同一分片只读盘一次）。单次读盘：raw 字节直接算 SHA-256（与
+    `file_sha256` 恒等），再按通用换行语义归一（CRLF 与孤立 `\\r`）后解析。
+    """
+    key = str(hop_id)
+    if cache is not None and key in cache:
+        return cache[key]
+    loaded = _load_hop_uncached(store, key)
+    if cache is not None:
+        cache[key] = loaded
+    return loaded
+
+
+def _load_hop_uncached(store: StoreContext, hop_id: str) -> LoadedHop | None:
+    if not re.fullmatch(r"H\d+", hop_id):
         return None
     path = store.hops_dir / hop_file_name(hop_id)
     if not path.is_file():
         return None
     try:
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
+        text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         hop = parse_hop_md(text)
     except (OSError, ValueError):
         return None
@@ -108,7 +253,7 @@ def _load_hop(store: StoreContext, hop_id: str) -> LoadedHop | None:
     for key in _HOP_HEADER_REQUIRED:
         if key not in header:
             return None
-    if str(header.get("hop_id", "")) != str(hop_id):
+    if str(header.get("hop_id", "")) != hop_id:
         return None
     try:
         version = int(header.get("v", 1))
@@ -122,7 +267,7 @@ def _load_hop(store: StoreContext, hop_id: str) -> LoadedHop | None:
     parents = [str(p) for p in parents]
     if any(not re.fullmatch(r"H\d+", p) for p in parents):
         return None
-    if str(hop_id) in parents:  # 自环 parent = 篡改痕迹，判损坏（F11 #6）
+    if hop_id in parents:  # 自环 parent = 篡改痕迹，判损坏（F11 #6）
         return None
     if not isinstance(header.get("title", ""), str):
         return None
@@ -131,7 +276,8 @@ def _load_hop(store: StoreContext, hop_id: str) -> LoadedHop | None:
         not isinstance(a, dict) for a in artifacts
     ):
         return None
-    return LoadedHop(hop=hop, sha=file_sha256(path), path=path)
+    _normalize_merkle_extension_header(header)
+    return LoadedHop(hop=hop, sha=hashlib.sha256(raw).hexdigest(), path=path)
 
 
 def _reachable_hops(store: StoreContext, head_hop: str) -> dict[str, LoadedHop] | None:
@@ -164,27 +310,31 @@ def _walk_origin_chain(
     chain_rev: list[LoadedHop] = []
     seen: set[str] = set()
     cur: str | None = str(head_hop)
+    loaded: LoadedHop | None = None
     while cur is not None:
         if cur in seen:
             return None, None, cur
         seen.add(cur)
-        loaded = _load_hop(store, cur)
         if loaded is None:
-            path = store.hops_dir / hop_file_name(cur)
-            return None, (None if path.is_file() else cur), (cur if path.is_file() else None)
+            loaded = _load_hop(store, cur)
+            if loaded is None:
+                path = store.hops_dir / hop_file_name(cur)
+                return None, (None if path.is_file() else cur), (cur if path.is_file() else None)
         if loaded.hop.header.get("topic_origin") != topic_id:
             return None, None, cur
         chain_rev.append(loaded)
         parents = [str(p) for p in (loaded.hop.header.get("parents") or [])]
         nxt = parents[0] if parents else None
-        if nxt is not None:
-            parent_loaded = _load_hop(store, nxt)
-            if parent_loaded is None:
-                path = store.hops_dir / hop_file_name(nxt)
-                return None, (None if path.is_file() else nxt), (nxt if path.is_file() else None)
-            if parent_loaded.hop.header.get("topic_origin") != topic_id:
-                nxt = None  # 边界：fork 基点在链外
+        if nxt is None:
+            break
+        parent_loaded = _load_hop(store, nxt)
+        if parent_loaded is None:
+            path = store.hops_dir / hop_file_name(nxt)
+            return None, (None if path.is_file() else nxt), (nxt if path.is_file() else None)
+        if parent_loaded.hop.header.get("topic_origin") != topic_id:
+            break  # 边界：fork 基点在链外
         cur = nxt
+        loaded = parent_loaded
     chain_rev.reverse()
     return chain_rev, None, None
 
@@ -213,16 +363,6 @@ def _origin_chain_from_reachable(
         cur = nxt
     chain_rev.reverse()
     return chain_rev
-
-
-def _parse_origin(origin: str | None) -> tuple[str, str, str] | None:
-    """解析 origin 属性 `<topic>:<item>@<hop>`；非法/缺失 → None。"""
-    if not origin:
-        return None
-    match = re.fullmatch(r"([A-Za-z0-9-]+):([CRQA]\d+)@(H\d+)", str(origin))
-    if match is None:
-        return None
-    return match.group(1), match.group(2), match.group(3)
 
 
 def _record_block_rows(topic_id: str, hop_id: str, block: HopBlock, rep: ReplayedChain) -> None:
@@ -1050,12 +1190,15 @@ def ensure_store_healthy(store: StoreContext) -> tuple[sqlite3.Connection, list[
     """七步自愈序 ⑦→⑥→③→①→②→⑤→④（D-P21），返回 (conn, 巡检报告)。
 
     版本守卫先于一切写盘/删盘（高版本 store 抛 UnsupportedSchemaVersion）；
-    ⑦ DB 缺失/损坏 → 冷重建（quick_check 探测）；级联文件删除在事务提交后执行，
-    回滚路径关闭连接。③→⑤ 的「重采纳后又判定损坏」在同一轮内闭环：重采纳的主题
-    会立刻被 ⑤ 的 DB 闭包判定再次级联，不会复活损坏数据。
+    ⑦ DB 缺失/损坏 → 冷重建（quick_check 探测）；健康库探测连接直接升格为工作
+    连接（免二次 connect），升格前补齐与 `get_or_create_db` 同款幂等初始化；
+    级联文件删除在事务提交后执行，回滚路径关闭连接。③→⑤ 的「重采纳后又判定
+    损坏」在同一轮内闭环：重采纳的主题会立刻被 ⑤ 的 DB 闭包判定再次级联，
+    不会复活损坏数据。
     """
     reports: list[dict] = []
     need_rebuild = not store.db_path.is_file()
+    probe: sqlite3.Connection | None = None
     if not need_rebuild:
         probe = sqlite3.connect(str(store.db_path))
         probe.row_factory = sqlite3.Row
@@ -1076,12 +1219,31 @@ def ensure_store_healthy(store: StoreContext) -> tuple[sqlite3.Connection, list[
                 need_rebuild = True
         except sqlite3.DatabaseError:
             need_rebuild = True
-        finally:
+        except BaseException:
             probe.close()
-    _raise_on_newer_schema(store)
+            raise
     if need_rebuild:
+        if probe is not None:
+            # rebuild 的 os.replace 前先关旧探测连接：防脱链 inode 的 WAL 清理竞态。
+            probe.close()
+        _raise_on_newer_schema(store)
         reports.extend(rebuild_db_from_markdown(store))
-    conn = get_or_create_db(store)
+        conn = get_or_create_db(store)
+    else:
+        assert probe is not None
+        try:
+            _raise_on_newer_schema(store)
+            # 复用前补齐 get_or_create_db 同款幂等初始化。
+            probe.executescript(_SCHEMA_SQL)
+            probe.execute("PRAGMA foreign_keys = ON")
+            probe.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '1')"
+            )
+            probe.commit()
+        except BaseException:
+            probe.close()
+            raise
+        conn = probe
     deferred_files: list[Path] = []
     try:
         reports.append(_repair_meta_json(store, conn))

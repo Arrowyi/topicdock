@@ -9,6 +9,7 @@ import json
 import sqlite3
 import types
 from pathlib import Path
+from unittest import mock
 
 from tests.util import (
     TopicDockTestCase,
@@ -780,3 +781,164 @@ class TestMergeDeleteUndo(TopicDockTestCase):
         ).header
         self.assertEqual(header["model"], "opencode-go/gemini-4-argon")
         self.assertEqual(header["actor"], "")
+
+
+class TestMerkleMergeIdentity(TopicDockTestCase):
+    """D8：merge/fork 的跨主题 Merkle 身份（双父 parent_oids + origin_oids 槽位）。"""
+
+    def _hop(self, store, hop_id):
+        path = Path(store) / "hops" / topicdock.hop_file_name(hop_id)
+        return topicdock.parse_hop_md(path.read_text(encoding="utf-8"))
+
+    def _oid(self, store, hop_id):
+        return topicdock.compute_hop_oid(self._hop(store, hop_id))
+
+    def test_merge_legacy_dst_derives_uid_double_parents_and_origin_oids(self):
+        store = make_store()
+        build_rich_store(store)
+        conn, _ = ensure_store_healthy(StoreContext(Path(store)))
+        conn.close()
+        code, data = run_cli_json(
+            ["merge", "gamma", "alpha", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        merge_hop = self._hop(store, data["head_hop"])
+        self.assertEqual(merge_hop.header["parents"], ["H004", "H006"])
+        self.assertEqual(
+            merge_hop.header["parent_oids"],
+            [self._oid(store, "H004"), self._oid(store, "H006")],
+        )
+        expected_uid = topicdock.hashlib.sha256(
+            b"topicdock-topic-uid:v1\0"
+            + self._oid(store, "H001").encode("utf-8")
+        ).hexdigest()[:32]
+        self.assertEqual(merge_hop.header["topic_uid"], expected_uid)
+        # 源旧链无 uid → 外源槽位 ""；续编后的块号 C5/Q2 映射源条目 C1/Q1
+        self.assertEqual(
+            merge_hop.header["origin_oids"]["C5"], ":C1@" + self._oid(store, "H006")
+        )
+        self.assertEqual(
+            merge_hop.header["origin_oids"]["Q2"], ":Q1@" + self._oid(store, "H006")
+        )
+        self.assertEqual(merge_hop.header["hop_oid"], topicdock.compute_hop_oid(merge_hop))
+
+    def test_merge_post_d8_src_uses_persisted_uid(self):
+        store = make_store()
+        for topic_id in ("src", "dst"):
+            code, _data = run_save(store, {
+                "topic_id": topic_id, "title": f"{topic_id} 标题",
+                "base_hop": None, "base_sha": None, "session_id": "ses-01",
+                "actor": "tester",
+                "mutations": [{"op": "create", "track": "C",
+                               "statement": f"{topic_id} 结论"}],
+            }, self.tmp_root)
+            self.assertEqual(code, 0)
+        src_uid = self._hop(store, "H001").header["topic_uid"]
+        dst_uid = self._hop(store, "H002").header["topic_uid"]
+        code, data = run_cli_json(
+            ["merge", "src", "dst", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        merge_hop = self._hop(store, data["head_hop"])
+        self.assertEqual(merge_hop.header["topic_uid"], dst_uid)
+        self.assertEqual(merge_hop.header["parents"], ["H002", "H001"])
+        self.assertEqual(
+            merge_hop.header["parent_oids"],
+            [self._oid(store, "H002"), self._oid(store, "H001")],
+        )
+        self.assertEqual(
+            merge_hop.header["origin_oids"]["C2"],
+            f"{src_uid}:C1@" + self._oid(store, "H001"),
+        )
+
+    def test_fork_post_d8_origin_uses_source_uid(self):
+        store = make_store()
+        code, data = run_save(store, {
+            "topic_id": "src", "title": "src 标题", "base_hop": None,
+            "base_sha": None, "session_id": "ses-01", "actor": "tester",
+            "mutations": [{"op": "create", "track": "C", "statement": "src 结论"}],
+        }, self.tmp_root)
+        self.assertEqual(code, 0)
+        src_uid = self._hop(store, "H001").header["topic_uid"]
+        code, fork = run_save(store, {
+            "topic_id": "src", "base_hop": "H001", "base_sha": data["base_sha"],
+            "session_id": "ses-02", "mutations": []},
+            self.tmp_root, "--fork-as", "beta")
+        self.assertEqual(code, 0)
+        fork_hop = self._hop(store, fork["head_hop"])
+        self.assertEqual(
+            fork_hop.header["parent_oids"], [self._oid(store, "H001")]
+        )
+        self.assertEqual(
+            fork_hop.header["origin_oids"]["C1"],
+            f"{src_uid}:C1@" + self._oid(store, "H001"),
+        )
+        self.assertNotEqual(fork_hop.header["topic_uid"], src_uid)  # fork 新 uuid
+
+
+# ===================== M3/D9：trace 多条目批处理与共享 hop_cache =====================
+
+
+class TestTraceMultiItem(TopicDockTestCase):
+    def _rich_live(self):
+        store = make_store()
+        build_rich_store(store)
+        code, data = run_cli_json(["list", "--store-dir", str(store), "--json"])
+        self.assertEqual((code, data["status"]), (0, "OK"))
+        return store
+
+    def test_multi_item_space_and_comma_mixed_dedup(self):
+        store = self._rich_live()
+        code, data = run_cli_json(
+            ["trace", "alpha", "C1,C1", "C2,Q1",
+             "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual((code, data["status"]), (0, "OK"))
+        self.assertEqual(data["item_ids"], ["C1", "C2", "Q1"])
+        self.assertEqual(list(data["items"]), ["C1", "C2", "Q1"])
+        self.assertNotIn("blocks", data)  # 多条目不重复拼接顶层 blocks
+        for item_id, trace in data["items"].items():
+            self.assertEqual(trace["item_id"], item_id)
+            self.assertTrue(trace["blocks"])
+            self.assertIn("successor_notes", trace)
+
+    def test_multi_item_missing_any_exits_5(self):
+        store = self._rich_live()
+        code, data = run_cli_json(
+            ["trace", "alpha", "C1,C9", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual((code, data["status"]), (5, "ITEM_NOT_FOUND"))
+
+    def test_single_item_keeps_legacy_shape(self):
+        store = self._rich_live()
+        code, data = run_cli_json(
+            ["trace", "alpha", "C1", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual((code, data["status"]), (0, "OK"))
+        self.assertIn("item_id", data)
+        self.assertIn("blocks", data)
+        self.assertNotIn("items", data)
+        self.assertNotIn("item_ids", data)
+
+    def test_shared_hop_cache_reads_each_hop_once(self):
+        store = self._rich_live()
+        ctx, conn = _open(store)
+        self.addCleanup(conn.close)
+        real_open = Path.open
+        counts: dict[str, int] = {}
+
+        def _counting_open(self, *args, **kwargs):
+            key = str(self)
+            counts[key] = counts.get(key, 0) + 1
+            return real_open(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", _counting_open):
+            result = cmd_trace_locked(
+                ctx, conn,
+                types.SimpleNamespace(topic="alpha", items=["C1", "C2,Q1"]),
+            )
+        self.assertEqual(result["item_ids"], ["C1", "C2", "Q1"])
+        # C2 与 Q1 同处 H002：共享 hop_cache 后该分片仅读盘 1 次（基线 2 次）。
+        self.assertEqual(counts.get(str(ctx.hops_dir / "hop-002.md")), 1)
+        for hop_path in sorted(ctx.hops_dir.glob("hop-00[1-3].md")):
+            self.assertLessEqual(counts.get(str(hop_path), 0), 1)

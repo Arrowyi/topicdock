@@ -27,6 +27,7 @@ def cmd_init(args: argparse.Namespace) -> tuple[dict, int]:
     gitignore_content = (
         "topicdock.db*\n.topicdock.lock\n*.tmp\n"
         ".topicdock-undo-pending.json\n.topicdock-amend-pending.json\n"
+        ".topicdock-published.json\n"
     )
     if (
         not ctx.gitignore_path.exists()
@@ -748,6 +749,126 @@ def _hop_trace_header(header: dict, actor: str = "", model: str = "",
     return header
 
 
+# ---------- D8 位置无关 Merkle 身份收口 ----------
+
+def _scan_topic_hops(store, topic_id):
+    """扫描 hops_dir 中 topic_origin == topic_id 的存活分片（跳号倒序）。"""
+    scanned = []
+    try:
+        paths = list(store.hops_dir.glob("hop-*.md"))
+    except OSError:
+        return scanned
+    for path in paths:
+        match = re.fullmatch(r"hop-(\d+)\.md", path.name)
+        if match is None:
+            continue
+        loaded = _load_hop(store, format_hop_id(int(match.group(1))))
+        if loaded is None:
+            continue
+        if str(loaded.hop.header.get("topic_origin", "")) != topic_id:
+            continue
+        scanned.append(loaded)
+    scanned.sort(
+        key=lambda loaded: _hop_number(str(loaded.hop.header.get("hop_id", ""))),
+        reverse=True,
+    )
+    return scanned
+
+
+def _persisted_topic_uid(store, conn, topic_id, chain=None):
+    """最近一个已持久化非空 str topic_uid；断链时扫描存活分片（不派生）。"""
+    if chain is None:
+        row = conn.execute(
+            "SELECT head_hop FROM topics WHERE topic_id=?", (topic_id,)
+        ).fetchone()
+        if row is None:
+            chain = []
+        else:
+            walked, _missing, _invalid = _walk_origin_chain(
+                store, row["head_hop"], topic_id
+            )
+            chain = walked or []
+    for loaded in reversed(chain):
+        uid = loaded.hop.header.get("topic_uid")
+        if isinstance(uid, str) and uid:
+            return uid
+    for loaded in _scan_topic_hops(store, topic_id):
+        uid = loaded.hop.header.get("topic_uid")
+        if isinstance(uid, str) and uid:
+            return uid
+    return ""
+
+
+def _resolve_topic_uid(store, conn, topic_id, chain):
+    """D8 topic_uid 继承；整链无 uid 时按可达最早跳确定性派生。"""
+    uid = _persisted_topic_uid(store, conn, topic_id, chain)
+    if uid:
+        return uid
+    if chain:
+        earliest = chain[0]
+    else:
+        scanned = _scan_topic_hops(store, topic_id)
+        earliest = scanned[-1] if scanned else None
+    if earliest is None:
+        # 整链分片均不可达：无最早跳可派生，只能开新血统
+        return uuid.uuid4().hex
+    digest = hashlib.sha256(
+        b"topicdock-topic-uid:v1\0"
+        + compute_hop_oid(earliest.hop).encode("utf-8")
+    ).hexdigest()
+    return digest[:32]
+
+
+def _finalize_hop_merkle_header(
+    store, conn, topic_id, header, blocks, chain, rep, *, fresh_uid=False
+):
+    """D8 唯一收口：header/blocks 定型后写入 4 个位置无关 Merkle 字段。"""
+    if fresh_uid:
+        header["topic_uid"] = uuid.uuid4().hex
+    else:
+        current_uid = header.get("topic_uid")
+        if not (isinstance(current_uid, str) and current_uid):
+            header["topic_uid"] = _resolve_topic_uid(
+                store, conn, topic_id, list(chain or [])
+            )
+
+    parents = header.get("parents")
+    if not isinstance(parents, list):
+        parents = []
+    parent_oids = []
+    for parent in parents:
+        parent_loaded = _load_hop(store, str(parent))
+        parent_oids.append(
+            compute_hop_oid(parent_loaded.hop) if parent_loaded is not None else ""
+        )
+    header["parent_oids"] = parent_oids
+
+    origin_oids = {}
+    for block in blocks:
+        if not block.origin:
+            continue
+        parsed = _parse_origin(block.origin)
+        if parsed is None:
+            continue
+        src_topic, src_item, origin_hop = parsed
+        src_uid = _persisted_topic_uid(store, conn, src_topic)
+        origin_loaded = _load_hop(store, origin_hop)
+        origin_oid = (
+            compute_hop_oid(origin_loaded.hop)
+            if origin_loaded is not None else ""
+        )
+        origin_oids[str(block.item_id)] = f"{src_uid}:{src_item}@{origin_oid}"
+    if origin_oids:
+        header["origin_oids"] = origin_oids
+    else:
+        header.pop("origin_oids", None)
+
+    header["hop_oid"] = compute_hop_oid(
+        HopDoc(header=header, blocks=list(blocks))
+    )
+    return header
+
+
 def _save_new_topic(store, conn, payload, topic_id, actor, model):
     """场景 1：base_hop=null 首次建档。"""
     doc = TopicDoc(topic_id=topic_id, title=str(payload.get("title") or topic_id))
@@ -765,6 +886,10 @@ def _save_new_topic(store, conn, payload, topic_id, actor, model):
         "next_focus": str(payload.get("next_focus", "")),
         "artifacts": _normalize_artifacts(payload.get("artifacts"), None),
     }, actor, model)
+    _finalize_hop_merkle_header(
+        store, conn, topic_id, header, blocks, [], ReplayedChain(doc=doc),
+        fresh_uid=True,
+    )
     counts = _count_creates(blocks)
     committed = _commit_new_hop(
         store, conn, topic_id=topic_id, header=header, blocks=blocks, doc=doc,
@@ -789,6 +914,8 @@ def _save_amend(store, conn, payload, topic_id, row, chain, rep, counters_alloca
     再 pending → 分片覆写 → md（提交点）→ DB 追平。"""
     head = row["head_hop"]
     head_loaded = _load_hop(store, head)
+    # D8：必须在改 created_at/summary/blocks 之前基于旧态完成 uid 提取/派生
+    resolved_uid = _resolve_topic_uid(store, conn, topic_id, chain)
     _counters, allocate = counters_allocate
     new_blocks = _normalize_mutations(
         conn, topic_id, rep.doc, rep, payload.get("mutations") or [], allocate
@@ -809,6 +936,10 @@ def _save_amend(store, conn, payload, topic_id, row, chain, rep, counters_alloca
     if actor and not _normalize_actor(new_header.get("actor")):
         new_header["actor"] = actor  # D7：空 actor 跳在 amend 时回填载荷 actor（防归属丢失）
     _hop_trace_header(new_header, model=model, amend=True)
+    new_header["topic_uid"] = resolved_uid
+    _finalize_hop_merkle_header(
+        store, conn, topic_id, new_header, merged_blocks, chain, rep
+    )
     hop_text = render_hop_md(HopDoc(header=new_header, blocks=merged_blocks))
     new_sha = sha256_text(hop_text)
     # 重放先行：载荷内顺序不合法 / 合并后自引用等在此收敛为 InvalidInput，磁盘零改动
@@ -934,6 +1065,9 @@ def _save_fork(store, conn, payload, topic_id, row, chain, rep, base_hop, fork_a
             payload.get("artifacts"), base_header.get("artifacts") or []
         ),
     }, actor, model)
+    _finalize_hop_merkle_header(
+        store, conn, fork_as, header, blocks, [], rep_base, fresh_uid=True
+    )
     doc = TopicDoc(topic_id=fork_as, title=title)
     counts = _count_creates(mutation_blocks)
     committed = _commit_new_hop(
@@ -1061,6 +1195,14 @@ def _save_locked(store, conn, payload, amend, fork_as, force_merge):
             head_actor and actor
             and _actor_subject(head_actor) != _actor_subject(actor)
         )
+        # D8 发布即封板：head 的权威 oid 已封板或台账损坏 → 一律失败关闭降级新建
+        published_oids, ledger_corrupt = read_published_oids(store)
+        head_published = False
+        if head_loaded is not None and not ledger_corrupt:
+            try:
+                head_published = compute_hop_oid(head_loaded.hop) in published_oids
+            except ValueError:
+                head_published = False
         amend_ok = (
             head_loaded is not None
             and not head_missing  # own 链有祖先缺失时 amend 只重放残缺链——禁止，降级新建
@@ -1068,6 +1210,7 @@ def _save_locked(store, conn, payload, amend, fork_as, force_merge):
             and str(head_loaded.hop.header.get("session_id", "")) == session_id
             and live_refs(conn, head) == 1
             and not actor_changed
+            and not (ledger_corrupt or head_published)
         )
         if amend_ok:
             return _save_amend(
@@ -1103,6 +1246,9 @@ def _save_locked(store, conn, payload, amend, fork_as, force_merge):
         "next_focus": str(payload.get("next_focus", "")),
         "artifacts": _normalize_artifacts(payload.get("artifacts"), artifacts_base),
     }, actor, model)
+    _finalize_hop_merkle_header(
+        store, conn, topic_id, header, blocks, chain or [], rep
+    )
     counts = _count_creates(blocks)
     committed = _commit_new_hop(
         store, conn, topic_id=topic_id, header=header, blocks=blocks, doc=rep.doc,
@@ -1196,6 +1342,9 @@ def _save_force_merge(store, conn, payload, topic_id, row, chain, rep, base_hop,
             payload.get("artifacts"), artifacts_base
         ),
     }, actor, model)
+    _finalize_hop_merkle_header(
+        store, conn, topic_id, header, blocks, chain or [], rep
+    )
     counts = _count_creates(blocks)
     committed = _commit_new_hop(
         store, conn, topic_id=topic_id, header=header, blocks=blocks, doc=rep.doc,
@@ -1361,6 +1510,9 @@ def _merge_payload(store, conn, args) -> dict:
             chain_src[-1].hop.header.get("artifacts") or [],
         ),
     }, actor, model)
+    _finalize_hop_merkle_header(
+        store, conn, dst_id, header, inherit_blocks, chain_dst, rep_dst
+    )
     src_md_path = store.topics_dir / f"{src_id}.md"
     pre_dst_md = (store.topics_dir / f"{dst_id}.md").read_text(encoding="utf-8")
     committed = _commit_new_hop(
@@ -1525,6 +1677,29 @@ def _undo_child_block_check(conn, hops_to_remove: set) -> None:
             )
 
 
+def _undo_published_block_check(store, payload: dict) -> None:
+    """封板台账恒强制（D8，与子跳引用同级，`--force` 不绕过）。
+
+    台账损坏 → 一切 undo 恒拦截（含无 `new_hop` 的 delete 型栈项）；
+    目标跳仍在且权威 `compute_hop_oid` 命中台账 → 恒拦截。
+    """
+    published_oids, ledger_corrupt = read_published_oids(store)
+    if ledger_corrupt:
+        raise InvalidInput("UNDO_BLOCKED: 已发布封板跳不可回滚")
+    new_hop = str(payload.get("new_hop") or "")
+    if not new_hop:
+        return
+    loaded = _load_hop(store, new_hop)
+    if loaded is None:
+        return
+    try:
+        hop_oid = compute_hop_oid(loaded.hop)
+    except ValueError:
+        return
+    if hop_oid in published_oids:
+        raise InvalidInput("UNDO_BLOCKED: 已发布封板跳不可回滚")
+
+
 def _undo_post_hash_check(store, payload: dict, force: bool) -> None:
     """post_hashes 校验（--force 仅放宽此层，D-P27）。"""
     if force:
@@ -1596,7 +1771,10 @@ def _undo_payload(store, conn, args) -> dict:
     if not isinstance(payload, dict):
         payload = {}
     op_type = str(entry.get("op_type", ""))
-    # 1. 校验：post_hashes（可放宽） + 子跳引用（恒强制，D-P27）
+    # 1. 校验：封板台账（恒强制，D8） + 子跳引用（恒强制，D-P27） +
+    #    post_hashes（--force 可放宽）——均在 journal 写之前；
+    #    拦截时栈弹出随调用方事务回滚恢复
+    _undo_published_block_check(store, payload)
     hops_to_remove: set = set()
     if op_type in ("save", "merge", "amend"):
         new_hop = str(payload.get("new_hop", ""))
@@ -1694,14 +1872,66 @@ def _undo_payload(store, conn, args) -> dict:
     }
 
 
+def _published_ledger_report(store) -> dict:
+    """doctor 封板台账巡检：缺失/合法 → ok；损坏 → invalid（失败关闭）。"""
+    oids, is_corrupt = read_published_oids(store)
+    if is_corrupt:
+        return {
+            "name": "published_ledger", "status": "invalid",
+            "detail": "封板台账损坏（失败关闭）：拒绝原地 amend 与一切 undo",
+        }
+    if not oids:
+        return {"name": "published_ledger", "status": "ok", "detail": "无封板记录"}
+    return {
+        "name": "published_ledger", "status": "ok",
+        "detail": f"已封板 {len(oids)} 跳",
+    }
+
+
+def _hop_oid_drift_report(store, conn) -> dict:
+    """doctor hop_oid 漂移巡检（非破坏性，仅 doctor 路径）。
+
+    扫描存活主题可达跳：跳头含 `hop_oid` 且与实时重算不一致 → 列出；无该键的
+    存量旧跳不算漂移；单跳重算抛 ValueError 降级为该跳的明细项，不让 doctor 崩溃。
+    """
+    live: set[str] = set()
+    for row in conn.execute("SELECT head_hop FROM topics").fetchall():
+        live |= _db_reachable(conn, row["head_hop"])
+    drift: list[str] = []
+    failed: list[str] = []
+    for hop_id in sorted(live):
+        loaded = _load_hop(store, hop_id)
+        if loaded is None or "hop_oid" not in loaded.hop.header:
+            continue
+        cached = loaded.hop.header.get("hop_oid")
+        cached = cached if isinstance(cached, str) else ""
+        try:
+            actual = compute_hop_oid(loaded.hop)
+        except ValueError as exc:
+            failed.append(f"{hop_id}（重算失败：{exc}）")
+            continue
+        if cached != actual:
+            drift.append(f"{hop_id}（缓存 {cached or '<空>'} ≠ 实算 {actual}）")
+    items = drift + failed
+    return {
+        "name": "hop_oid_drift", "status": "drift" if items else "ok",
+        "detail": "; ".join(items) if items else "无跳头 hop_oid 漂移",
+    }
+
+
 def _doctor_payload(store, conn_unused, args) -> dict:
-    """doctor [--rebuild]：无参 = 七步自愈巡检报告；--rebuild = 强制冷重建。"""
+    """doctor [--rebuild]：无参 = 七步自愈巡检 + 封板台账/oid 漂移双巡检；
+    --rebuild = 强制冷重建（保留既有封板台账）。"""
     if getattr(args, "rebuild", False):
         reports = rebuild_db_from_markdown(store)
         return {"status": "OK", "checks": reports}
     conn, reports = ensure_store_healthy(store)
-    conn.commit()
-    conn.close()
+    try:
+        conn.commit()
+        reports.append(_published_ledger_report(store))
+        reports.append(_hop_oid_drift_report(store, conn))
+    finally:
+        conn.close()
     return {"status": "OK", "checks": reports}
 
 
@@ -1868,10 +2098,10 @@ def _render_block_text(block) -> str:
     return "\n".join(lines)
 
 
-def _block_entry_for(store, row) -> dict:
+def _block_entry_for(store, row, hop_cache=None) -> dict:
     """trace 的单块条目：加载分片 → 渲染该跳中 item_id 匹配的块；缺失 → missing 标注。"""
     entry = {"hop_id": row["hop_id"], "op": row["op"]}
-    loaded = _load_hop(store, row["hop_id"])
+    loaded = _load_hop(store, row["hop_id"], hop_cache)
     if loaded is None:
         entry["missing"] = True
         return entry
@@ -1882,6 +2112,103 @@ def _block_entry_for(store, row) -> dict:
     if texts:
         entry["text"] = "\n\n".join(texts)
     return entry
+
+
+def _trace_auto_item_ids(doc) -> list:
+    """auto 追根目标：当前全部未决 `[Q]` + 状态为 `[~]` 的 `[A]`（保序去重）。"""
+    item_ids = [item.item_id for item in doc.items.get("Q", [])]
+    item_ids.extend(
+        item.item_id for item in doc.items.get("A", []) if item.a_state == "~"
+    )
+    return list(dict.fromkeys(item_ids))
+
+
+def _split_trace_items(spec) -> list:
+    """逗号拆分的显式条目清单（去空白、保序去重）；空集 → InvalidInput。"""
+    item_ids = [part.strip() for part in str(spec).split(",") if part.strip()]
+    item_ids = list(dict.fromkeys(item_ids))
+    if not item_ids:
+        raise InvalidInput("--trace 需要 auto 或至少一个 item_id")
+    return item_ids
+
+
+def _validate_trace_spec(spec) -> None:
+    """`auto` 或非空逗号清单；仅做语法校验（空集 → InvalidInput）。"""
+    if spec is None or str(spec).strip() == "auto":
+        return
+    _split_trace_items(spec)
+
+
+def _trace_item_ids(doc, spec) -> list:
+    if str(spec).strip() == "auto":
+        return _trace_auto_item_ids(doc)
+    return _split_trace_items(spec)
+
+
+def _trace_item_payload(store, conn, topic_id: str, item_id: str, hop_cache) -> dict:
+    """单条目 trace 字典（与既有单条目 `cmd_trace_locked` 返回同构）。"""
+    trace = get_item_trace(conn, topic_id, item_id)
+    if not trace["blocks"] and not trace["links"]:
+        raise ItemNotFoundError(f"条目不存在: {topic_id}:{item_id}")
+    blocks = []
+    for block_row in list(trace["blocks"]) + list(trace["ancestry"]):
+        entry = _block_entry_for(store, block_row, hop_cache)
+        if str(block_row.get("topic_id", topic_id)) != topic_id:
+            entry["from_topic"] = str(block_row["topic_id"])  # 跨主题递归区分
+        blocks.append(entry)
+    # 被推翻条目的去向块：successor(overturn) 所在跳的推翻块并入 blocks 尾部
+    for succ in trace["successors"]:
+        if succ["link_type"] != "overturn":
+            continue
+        entry = {"hop_id": succ["hop_id"], "op": "overturn"}
+        loaded = _load_hop(store, succ["hop_id"], hop_cache)
+        if loaded is None:
+            entry["missing"] = True
+        else:
+            texts = [
+                _render_block_text(block)
+                for block in loaded.hop.blocks if block.item_id == succ["item_id"]
+            ]
+            if texts:
+                entry["text"] = "\n\n".join(texts)
+        blocks.append(entry)
+    successor_notes = []
+    for succ in trace["successors"]:
+        target = succ["item_id"]
+        if succ["topic_id"] != topic_id:  # 同主题省 topic 前缀
+            target = f"{succ['topic_id']}:{succ['item_id']}"
+        successor_notes.append(f"于 {succ['hop_id']} {succ['link_type']} 转入 {target}")
+    return {
+        "status": "OK", "topic_id": topic_id, "item_id": item_id,
+        "blocks": blocks, "links": trace["links"],
+        "successor": trace["successors"], "successor_notes": successor_notes,
+    }
+
+
+def _collect_traces(store, conn, topic_id: str, item_ids, hop_cache) -> dict:
+    """批量追根；显式条目缺失置 `{"missing_item": true}` 不中断主挂载。"""
+    traces: dict = {}
+    for item_id in item_ids:
+        try:
+            traces[item_id] = _trace_item_payload(
+                store, conn, topic_id, item_id, hop_cache
+            )
+        except ItemNotFoundError:
+            traces[item_id] = {"missing_item": True}
+    return traces
+
+
+def _attach_mount_traces(store, conn, payload: dict, args, hop_cache) -> dict:
+    """挂载成功后按 `--trace <auto|items>` 附加同轮内联历史块。"""
+    spec = getattr(args, "trace", None)
+    if spec is None:
+        return payload
+    doc = parse_topic_md(payload["text"])
+    payload["traces"] = _collect_traces(
+        store, conn, payload["topic_id"], _trace_item_ids(doc, spec), hop_cache
+    )
+    return payload
+
 
 
 def _history_entry(header: dict, hop_id: str) -> dict:
@@ -1962,12 +2289,14 @@ def cmd_use_locked(store, conn, args) -> dict:
                 "note": "store 尚无主题：先调 td init / 首次 save 建档",
             }
         if len(rows) == 1:
-            return _mount_topic(store, conn, rows[0]["topic_id"])
+            payload = _mount_topic(store, conn, rows[0]["topic_id"])
+            return _attach_mount_traces(store, conn, payload, args, {})
         listing = _list_page(conn, page=1, page_size=10, filter_kw=None, show_all=False)
         listing["hint"] = "回复序号挂载对应主题；或用 --page 翻页 / --filter 过滤后再挂载"
         return listing
     row = _resolve_topic_selector(conn, selector)
-    return _mount_topic(store, conn, row["topic_id"])
+    payload = _mount_topic(store, conn, row["topic_id"])
+    return _attach_mount_traces(store, conn, payload, args, {})
 
 
 def cmd_list(args) -> tuple[dict, int]:
@@ -2060,16 +2389,34 @@ def cmd_match_locked(store, conn, args) -> dict:
         raise InvalidInput("match 至少需要一个 --topic 查询词，或使用 --recent")
     threshold = getattr(args, "threshold", None)
     threshold = 35.0 if threshold is None else float(threshold)
+    trace_spec = getattr(args, "trace", None)
+    if trace_spec is not None:
+        _validate_trace_spec(trace_spec)
     results = match_topics(
         conn, [str(query) for query in queries], threshold=threshold,
         recent=recent,
     )
+    hop_cache: dict = {}
     for offset, entry in enumerate(results):
-        if offset < 5:  # 前 ≤5 附全文（D-P16 同口径）
+        if offset < 5:  # 前 ≤5 附完整挂载凭证（D-P16/D9 同口径）
             entry["full"] = True
-            entry["text"] = (
+            text = (
                 store.topics_dir / f"{entry['topic_id']}.md"
             ).read_text(encoding="utf-8")
+            entry["text"] = text
+            doc = parse_topic_md(text)
+            entry["head_hop"] = str(doc.head_hop)
+            sha_row = conn.execute(
+                "SELECT md_sha256 FROM topics WHERE topic_id=?",
+                (entry["topic_id"],),
+            ).fetchone()
+            entry["base_sha"] = str(sha_row["md_sha256"]) if sha_row is not None else ""
+            entry["artifacts"] = probe_artifact_links(doc, Path.cwd())
+            if trace_spec is not None:
+                entry["traces"] = _collect_traces(
+                    store, conn, entry["topic_id"],
+                    _trace_item_ids(doc, trace_spec), hop_cache,
+                )
         else:
             entry["full"] = False
     return {"status": "OK", "results": results}
@@ -2091,49 +2438,41 @@ def cmd_trace(args) -> tuple[dict, int]:
     return result, EXIT_OK
 
 
+def _trace_items_from_args(args) -> list:
+    """trace 位置参数：兼容新 `items`（列表）与旧 `item`（单字符串），逐项逗号拆分。"""
+    raw = getattr(args, "items", None)
+    if raw is None:
+        raw = getattr(args, "item", "")
+    chunks = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+    item_ids: list = []
+    for chunk in chunks:
+        for part in str(chunk).split(","):
+            part = part.strip()
+            if part:
+                item_ids.append(part)
+    item_ids = list(dict.fromkeys(item_ids))
+    if not item_ids:
+        raise InvalidInput("trace 需要至少一个 item_id")
+    return item_ids
+
+
 def cmd_trace_locked(store, conn, args) -> dict:
     topic_id = str(getattr(args, "topic", ""))
-    item_id = str(getattr(args, "item", ""))
+    item_ids = _trace_items_from_args(args)
     row = conn.execute(
         "SELECT topic_id FROM topics WHERE topic_id=?", (topic_id,)
     ).fetchone()
     if row is None:
         raise TopicNotFoundError(f"主题不存在: {topic_id}")
-    trace = get_item_trace(conn, topic_id, item_id)
-    if not trace["blocks"] and not trace["links"]:
-        raise ItemNotFoundError(f"条目不存在: {topic_id}:{item_id}")
-    blocks = []
-    for block_row in list(trace["blocks"]) + list(trace["ancestry"]):
-        entry = _block_entry_for(store, block_row)
-        if str(block_row.get("topic_id", topic_id)) != topic_id:
-            entry["from_topic"] = str(block_row["topic_id"])  # 跨主题递归区分
-        blocks.append(entry)
-    # 被推翻条目的去向块：successor(overturn) 所在跳的推翻块并入 blocks 尾部
-    for succ in trace["successors"]:
-        if succ["link_type"] != "overturn":
-            continue
-        entry = {"hop_id": succ["hop_id"], "op": "overturn"}
-        loaded = _load_hop(store, succ["hop_id"])
-        if loaded is None:
-            entry["missing"] = True
-        else:
-            texts = [
-                _render_block_text(block)
-                for block in loaded.hop.blocks if block.item_id == succ["item_id"]
-            ]
-            if texts:
-                entry["text"] = "\n\n".join(texts)
-        blocks.append(entry)
-    successor_notes = []
-    for succ in trace["successors"]:
-        target = succ["item_id"]
-        if succ["topic_id"] != topic_id:  # 同主题省 topic 前缀
-            target = f"{succ['topic_id']}:{succ['item_id']}"
-        successor_notes.append(f"于 {succ['hop_id']} {succ['link_type']} 转入 {target}")
+    hop_cache: dict = {}
+    if len(item_ids) == 1:
+        return _trace_item_payload(store, conn, topic_id, item_ids[0], hop_cache)
+    items: dict = {}
+    for item_id in item_ids:
+        items[item_id] = _trace_item_payload(store, conn, topic_id, item_id, hop_cache)
     return {
-        "status": "OK", "topic_id": topic_id, "item_id": item_id,
-        "blocks": blocks, "links": trace["links"],
-        "successor": trace["successors"], "successor_notes": successor_notes,
+        "status": "OK", "topic_id": topic_id,
+        "item_ids": item_ids, "items": items,
     }
 
 

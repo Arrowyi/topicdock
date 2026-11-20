@@ -28,8 +28,8 @@ TopicDock 把记忆的单位从客户端绑定的「会话」换成你自己拥�
 
 [`SKILL.md`](SKILL.md) 是工作流的权威规范，其中的 3 行常驻守则如下（`install.py` 会把它们注入工作区的 `CLAUDE.md` / `AGENTS.md`；`/topicdock` 命令模板同样指向这套三支柱工作流）：
 
-- **TopicDock 调取（Read）**：仅在会话开启首个实质话题、用户点名（`继续 <id|序号>` / `/topicdock`）或中途切入**未挂载的新话题**时，加载 `topicdock` Skill 调用 `td use` 或拆解关键词调用 `td match`（`td match` 含 `--recent` 定位到目标 `topic_id` 后，必须同轮紧接着调一次 `td use <topic_id>` 获取完整 `base_sha` 完成正式挂载）；已挂载主题在同会话同角色后续轮次直接对话，**0 次重复查库与读取**（若发生上下文压缩 Compaction 丢失正文，或同会话切换了 Agent 角色，凭上一条消息末尾的 `⚓ TopicDock: <id> (<head_hop>@<sha6>)` 重调一次 `td use <id>` 刷新完整凭证）。
-- **TopicDock 追根（Trace）**：凡 ① 用户质疑、推翻或深挖某条已挂载结论 `[C]`、排除项 `[R]`、待决 `[Q]` 或行动 `[A]`（含已折叠/已推翻/已合流项）；② 跨会话/跨角色接手未决 `[Q]` 或断点 `[~][A]` 需读取前序跳的多行 `推导与权衡` 与 `核心证据`；③ 基于既有 `[C]/[R]` 继续深化设计或编码而顶层单行摘要不足以确认边界细节时，必须先调用 `td trace <topic_id> <item_id>` 全量拉取底层 `hop-NNN.md` 历次证据块，严禁仅凭顶层一句话摘要臆测。
+- **TopicDock 调取（Read）**：仅在会话开启首个实质话题、用户点名（`继续 <id|序号>` / `/topicdock`）或中途切入**未挂载的新话题**时，加载 `topicdock` Skill 调用 `td use` 或拆解关键词调用 `td match`（`td match` 含 `--recent` 前 ≤ 5 个 `full: true` 命中项直接返回 `head_hop`、完整 64-hex `base_sha`、账本全文与 `artifacts`，单次 match 即完成正式挂载，免第 2 轮 `td use`；目标排第 6+ 才需补调一次 `td use <id>`）；已挂载主题在同会话同角色后续轮次直接对话，**0 次重复查库与读取**（若发生上下文压缩 Compaction 丢失正文，或同会话切换了 Agent 角色，凭上一条消息末尾的 `⚓ TopicDock: <id> (<head_hop>@<sha6>)` 重调一次 `td use <id>` 刷新完整凭证）。
+- **TopicDock 追根（Trace）**：凡 ① 用户质疑、推翻或深挖某条已挂载结论 `[C]`、排除项 `[R]`、待决 `[Q]` 或行动 `[A]`（含已折叠/已推翻/已合流项）；② 跨会话/跨角色接手未决 `[Q]` 或断点 `[~][A]` 需读取前序跳的多行 `推导与权衡` 与 `核心证据`；③ 基于既有 `[C]/[R]` 继续深化设计或编码而顶层单行摘要不足以确认边界细节时，必须先调用 `td trace <topic_id> <item_id>`（多条目可单次调用：`td trace <topic> C1,C2,Q3`）全量拉取底层 `hop-NNN.md` 历次证据块，严禁仅凭顶层一句话摘要臆测。
 - **TopicDock 沉淀（Write）**：仅由**顶层主 Agent**（严禁 Subagent 调用，且禁止用户手改 Markdown 文件）在触达 4 类自然收敛节点——① 达成/推翻 `[C]/[R]` 定论；② 浮现需用户确认或需下一会话/下一阶段/另一角色拍板的未决问题 `[Q]`；③ `[A]` 阶段完成 `[x]` 或停在自然交接断点 `[~]`；④ 话题切换或收尾——时**当轮回复前立即调用 `td save`**（严禁先口头询问“是否交接/保存”再等下一轮；同会话同 `actor` 后续增量默认传 `--amend` 原地更新当前跳，跨会话或切换 `actor` 不传 `--amend` 自动新建下一跳）；并在回复末尾回显一行 `⚓ TopicDock: <topic-id> (<head_hop>@<base_sha前6位>)`。
 
 ```bash
@@ -160,18 +160,18 @@ td trace auth-refactor C1
 - **封板降级：** `⚓ TopicDock: <id> (<old> 已封板 → 自动新建 <head_hop>@<sha6> | +1[C] +1[A])`。上一个 head 跳已封板时，保存会自动新建下一跳并输出这一行。
 - **常规 / amend / merge：** `⚓ TopicDock: <id> (<head_hop>@<sha6> | …)`。`--amend` 保存时带 ` amend` 段；没有新增条目时输出 `无新增条目`。
 
-*注：引擎输出字符串在 v1 未翻译（prompt 英化另轨）。*
+*注：prompt 与文档面已英文化（双语触发词保留）；引擎运行时 `status`/`echo`/`hint` 文案与 Markdown 协议字面量有意维持 v1 中文原样，不改。*
 
 ## 11 个子命令与退出码速查
 
 | 命令 | 参数签名 | 说明 |
 |---|---|---|
 | `td init` | `--scope global\|local [--path <dir>]` | 初始化存储库，幂等 |
-| `td use` | `[<topic_id\|index>]` | 挂载主题，返回账本全文 + `(head_hop, base_sha)`；无参时按库内主题数引导 |
-| `td match` | `[--topic <kw> [--topic <kw2> …]] [--threshold 35] [--recent]` | 关键词打分召回（同分按 `updated_at` 倒序、`topic_id` 升序）；`--recent` 免 `--topic` 直接取最近 ≤ 5 个 |
+| `td use` | `[<topic_id\|index>] [--trace <auto\|items>]` | 挂载主题，返回账本全文 + `(head_hop, base_sha)`；无参时按库内主题数引导；可选 `--trace auto` 同轮内联全部未决 `[Q]` 与断点 `[~][A]` 的完整历史块 |
+| `td match` | `[--topic <kw> [--topic <kw2> …]] [--threshold 35] [--recent] [--trace <auto\|items>]` | 关键词打分召回（同分按 `updated_at` 倒序、`topic_id` 升序）；`--recent` 免 `--topic` 直接取最近 ≤ 5 个；前 5 命中（`full: true`）直接附挂载凭证 `head_hop`/完整 `base_sha`/`artifacts`，单次 match 即完成挂载，第 6 项起不附 |
 | `td save` | `--stdin \| --json-file <path> [--amend] [--fork-as <new_id>] [--force-merge]` | 唯一权威写入入口，带乐观并发校验；载荷可选 `model` 字符串（新建跳缺省不落键，`--amend` 缺省保留原值） |
 | `td merge` | `<src_topic_id> <dst_topic_id> [--summary "..."] [--session-id] [--actor] [--model] [--next-focus]` | 跨主题合流：src 条目并入 dst，trace 不断链（`--actor`/`--model` 默认 `""`） |
-| `td trace` | `<topic_id> <item_id>` | 拉取条目的全部历史证据块，已推翻/已折叠/已合流项同样可查 |
+| `td trace` | `<topic_id> <item_id> [<item2> …]` | 拉取条目的全部历史证据块，已推翻/已折叠/已合流项同样可查；支持单次多条目（空格/逗号分隔如 `C1,C2,Q3`，单条目输出与旧版完全一致） |
 | `td list` | `[--page P] [--page-size 10] [--all] [--filter "<kw>"]` | 分页列出主题，按 `updated_at` 倒序 |
 | `td view` | `<topic_id\|index> [--history]` | 只读查看；`--history` 输出跳摘要链（含 `model` 时一并输出） |
 | `td delete` | `<expr> [--dry-run] [--yes]` | 默认只预览；`--yes` 只接受显式 topic_id 列表 |
