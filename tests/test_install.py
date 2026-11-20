@@ -1,7 +1,8 @@
 """M8/M5 安装测试 —— tests.test_install：四 client 各自独立技能目录（cursor 全局
 ~/.cursor/skills、codex 项目级 <cwd>/.agents/skills）、哨兵块幂等、按记忆文件定义的
 uninstall 归属（AGENTS.md 跨 client 探测 / CLAUDE.md 仅 claude）、引擎执行位、全局库
-自动初始化、td 链接、自动 build、/topicdock 命令模板（codex 无）。"""
+自动初始化、td 链接、自动 build、/topicdock 命令模板（claude/opencode 两客户端；
+cursor 已下线，含哨兵的遗留文件在安装/卸载时自动清理，codex 无）。"""
 
 from __future__ import annotations
 
@@ -110,7 +111,7 @@ class TestInstallLayout(InstallLayoutTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self._assert_skill_layout("codex")
         self._assert_block("codex")
-        # codex 无命令模板：三个命令客户端落位均不得出现
+        # codex 无命令模板：命令客户端落位均不得出现
         self.assertFalse(self._command_path("cursor").exists())
         self.assertFalse((self.home_dir / ".claude" / "commands").exists())
         self.assertFalse((self.home_dir / ".config" / "opencode" / "commands").exists())
@@ -132,9 +133,10 @@ class TestInstallLayout(InstallLayoutTestCase):
         self.assertEqual(len(skill_roots), 4, "四客户端技能目录必须彼此独立")
         for client in ("claude", "opencode", "cursor", "codex"):
             self.assertTrue(self._skill_root(client).is_dir())
-        # 3 个命令模板（claude/opencode/cursor），codex 无
-        for client in ("claude", "opencode", "cursor"):
+        # 2 个命令模板（claude/opencode），codex 无，cursor 已下线不再生成
+        for client in ("claude", "opencode"):
             self.assertTrue(self._command_path(client).is_file())
+        self.assertFalse(self._command_path("cursor").exists())
         self.assertFalse((self.workspace_dir / ".codex").exists())
         self.assertFalse((self.home_dir / ".codex").exists())
         # opencode/cursor/codex 共注后 <cwd>/AGENTS.md 恰有一个哨兵块
@@ -264,29 +266,32 @@ class TestUninstall(InstallLayoutTestCase):
         self.assertEqual(proc.stdout, "", "no-op 卸载不得输出共享产物提示")
 
     def test_uninstall_codex_removes_own_products_keeps_cursor(self):
-        """卸 codex：删自己的 <cwd>/.agents/skills 技能目录；cursor 全局技能/命令目录保留；
-        AGENTS.md 因 cursor 仍装而保留块并提示。"""
+        """卸 codex：删自己的 <cwd>/.agents/skills 技能目录；cursor 全局技能目录保留
+        （命令模板已下线不再生成）；AGENTS.md 因 cursor 仍装而保留块并提示。"""
         self.assertEqual(run_install("--client", "cursor").returncode, 0)
         self.assertEqual(run_install("--client", "codex").returncode, 0)
         proc = run_install("--client", "codex", "--uninstall")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(self._skill_root("codex").exists())
         self.assertTrue(self._skill_root("cursor").is_dir(), "codex 卸载不得移除 cursor 技能目录")
-        self.assertTrue(self._command_path("cursor").is_file(), "cursor 命令模板不得被 codex 卸载移除")
+        self.assertFalse(self._command_path("cursor").exists(), "cursor 命令模板已下线，安装不再生成")
         text = self._memory_file("codex").read_text(encoding="utf-8")
         self.assertIn(SENTINEL_BEGIN, text, "cursor 仍装时 AGENTS.md 守则块应保留")
         self.assertIn("保留", proc.stdout)
         self.assertIn("cursor", proc.stdout)
 
     def test_uninstall_cursor_removes_own_products_and_command(self):
-        """卸 cursor：删自己的 ~/.cursor/skills 与 ~/.cursor/commands 产物；codex 仍在，
-        AGENTS.md 守则块保留并提示。"""
+        """卸 cursor：删自己的 ~/.cursor/skills 与预置的哨兵遗留命令文件（静默清理）；
+        codex 仍在，AGENTS.md 守则块保留并提示。"""
         self.assertEqual(run_install("--client", "cursor").returncode, 0)
         self.assertEqual(run_install("--client", "codex").returncode, 0)
+        legacy = self._command_path("cursor")
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(f"{COMMAND_SENTINEL}\n# 遗留命令模板\n", encoding="utf-8")
         proc = run_install("--client", "cursor", "--uninstall")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(self._skill_root("cursor").exists())
-        self.assertFalse(self._command_path("cursor").exists(), "cursor 卸载应移除自己的命令模板")
+        self.assertFalse(legacy.exists(), "cursor 卸载应清理预置的哨兵遗留命令文件")
         self.assertTrue(self._skill_root("codex").is_dir(), "cursor 卸载不得移除 codex 技能目录")
         text = self._memory_file("cursor").read_text(encoding="utf-8")
         self.assertIn(SENTINEL_BEGIN, text, "codex 仍装时 AGENTS.md 守则块应保留")
@@ -338,7 +343,8 @@ class TestAutoBuild(InstallLayoutTestCase):
 
 
 class TestCommandTemplate(InstallLayoutTestCase):
-    """/topicdock 命令模板：三客户端落位、幂等、卸载对称、接管升级、外来不动、--dest 重定向。"""
+    """/topicdock 命令模板：两客户端（claude/opencode）落位、幂等、卸载对称、接管升级、
+    外来不动、--dest 重定向；cursor 遗留哨兵文件在安装/卸载时自动清理。"""
 
     TEMPLATE_TEXT = _TEMPLATE.read_text(encoding="utf-8")
 
@@ -359,11 +365,13 @@ class TestCommandTemplate(InstallLayoutTestCase):
         self.assertNotIn("merge", text)
         self.assertNotIn("合并", text)
 
-    def test_command_template_installed_all_three(self):
+    def test_command_template_installed_claude_opencode(self):
         proc = run_install("--client", "all")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        for client in ("claude", "opencode", "cursor"):
+        for client in ("claude", "opencode"):
             self._assert_command_template(client)
+        # cursor 命令模板已下线：全量安装不得生成
+        self.assertFalse(self._command_path("cursor").exists())
 
     def test_command_reinstall_is_idempotent_overwrite(self):
         self.assertEqual(run_install("--client", "claude").returncode, 0)
@@ -376,7 +384,7 @@ class TestCommandTemplate(InstallLayoutTestCase):
     def test_command_uninstall_symmetric(self):
         self.assertEqual(run_install("--client", "all").returncode, 0)
         self.assertEqual(run_install("--client", "all", "--uninstall").returncode, 0)
-        for client in ("claude", "opencode", "cursor"):
+        for client in ("claude", "opencode"):
             self.assertFalse(self._command_path(client).exists())
 
     def test_uninstall_without_install_is_noop_for_commands(self):
@@ -384,7 +392,8 @@ class TestCommandTemplate(InstallLayoutTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(self._command_path("claude").exists())
 
-    def test_foreign_command_file_skipped_and_hinted(self):
+    def test_foreign_command_file_left_untouched_silently(self):
+        """cursor 安装不再管理命令文件：外来同名文件静默保留（无任何提示），卸载同样不动。"""
         path = self._command_path("cursor")
         path.parent.mkdir(parents=True)
         foreign = "# 我的自定义 /topicdock 命令\n\n自有内容，不应被覆盖。\n"
@@ -392,8 +401,8 @@ class TestCommandTemplate(InstallLayoutTestCase):
         proc = run_install("--client", "cursor")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(path.read_text(encoding="utf-8"), foreign, "外来同名文件绝不能被静默覆盖")
-        self.assertIn("跳过", proc.stdout)
-        self.assertIn(str(path), proc.stdout)
+        self.assertNotIn("跳过", proc.stdout)
+        self.assertNotIn(str(path), proc.stdout)
         # 卸载也不动外来文件
         self.assertEqual(run_install("--client", "cursor", "--uninstall").returncode, 0)
         self.assertEqual(path.read_text(encoding="utf-8"), foreign)
@@ -414,7 +423,7 @@ class TestCommandTemplate(InstallLayoutTestCase):
         dest = self.tmp_root / "custom-root"
         proc = run_install("--client", "all", "--dest", str(dest))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        for client in ("claude", "opencode", "cursor"):
+        for client in ("claude", "opencode"):
             redirected = dest / client / "commands" / "topicdock.md"
             self.assertTrue(redirected.is_file(), f"{client} 命令模板应落在 <dest>/<client>/commands/")
             self.assertEqual(
@@ -633,7 +642,7 @@ class TestInstallShell(TopicDockTestCase):
         command = self.home_dir / ".cursor" / "commands" / "topicdock.md"
         engine = self._cursor_skill() / "scripts" / "topicdock.py"
         self.assertTrue(skill.is_file(), "cursor 技能应落位 ~/.cursor/skills/topicdock/SKILL.md")
-        self.assertTrue(command.is_file(), "cursor 命令模板应落位 ~/.cursor/commands/topicdock.md")
+        self.assertFalse(command.exists(), "cursor 命令模板已下线：新装不得生成 ~/.cursor/commands/topicdock.md")
         self.assertTrue(os.access(engine, os.X_OK), "已装引擎副本应保留执行位")
         self.assertTrue(
             (self.home_dir / ".topicdock" / ".topicdock-meta.json").is_file(),
@@ -714,6 +723,66 @@ class TestInstallShell(TopicDockTestCase):
     def test_invalid_client_value_fails(self):
         proc = self._run("--client", "vscode")
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+
+class TestLegacyCursorCommandCleanup(InstallLayoutTestCase):
+    """cursor 命令模板下线后的存量自愈：安装/卸载 cursor（或 all）自动清理含哨兵的
+    遗留命令文件——安装侧命中打印提示、卸载侧静默；外来（不含哨兵）与不可读
+    （非 UTF-8）文件一律不动；安装其他单客户端不触发清理。"""
+
+    def _legacy_path(self) -> Path:
+        return self._command_path("cursor")
+
+    def test_install_cursor_removes_sentinel_legacy_file_with_hint(self):
+        path = self._legacy_path()
+        path.parent.mkdir(parents=True)
+        path.write_text(f"{COMMAND_SENTINEL}\n# 旧版 /topicdock\n", encoding="utf-8")
+        proc = run_install("--client", "cursor")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(path.exists(), "安装 cursor 应自动清理含哨兵的遗留命令文件")
+        self.assertIn(str(path), proc.stdout, "清理命中应打印一行含路径的提示")
+        self.assertIn("清理", proc.stdout)
+
+    def test_install_cursor_keeps_non_utf8_file_with_degrade_hint(self):
+        path = self._legacy_path()
+        path.parent.mkdir(parents=True)
+        raw = b"\xff\xfe\x00binary-not-utf8"
+        path.write_bytes(raw)
+        proc = run_install("--client", "cursor")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(path.read_bytes(), raw, "不可读（非 UTF-8）文件绝不能被动")
+        self.assertIn("保留原样", proc.stdout, "读取失败应打印降级提示且不中断安装")
+
+    def test_uninstall_non_utf8_file_survives_and_converges(self):
+        """先装 cursor 再预置非 UTF-8 命令文件：卸载不中断（退出码 0）、文件原样保留、
+        技能目录已删、守则块被移除（cursor 为唯一守则注入方时），且再次卸载同样
+        退出码 0（重跑收敛钉）。"""
+        self.assertEqual(run_install("--client", "cursor").returncode, 0)
+        path = self._legacy_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw = b"\xff\xfe\x00binary-not-utf8"
+        path.write_bytes(raw)
+        proc = run_install("--client", "cursor", "--uninstall")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(path.read_bytes(), raw, "卸载不得动不可读（非 UTF-8）文件")
+        self.assertFalse(self._skill_root("cursor").exists(), "cursor 技能目录应被删除")
+        self.assertNotIn(
+            SENTINEL_BEGIN, self._memory_file("cursor").read_text(encoding="utf-8"),
+            "cursor 为唯一 AGENTS.md 守则注入方时，卸载应移除守则块",
+        )
+        # 重跑收敛钉：重复卸载仍成功且文件仍原样
+        self.assertEqual(run_install("--client", "cursor", "--uninstall").returncode, 0)
+        self.assertEqual(path.read_bytes(), raw)
+
+    def test_install_codex_does_not_touch_cursor_legacy_file(self):
+        """README 口径钉子：仅 install/uninstall cursor 或 all 触发清理。"""
+        path = self._legacy_path()
+        path.parent.mkdir(parents=True)
+        legacy = f"{COMMAND_SENTINEL}\n# 旧版 /topicdock\n"
+        path.write_text(legacy, encoding="utf-8")
+        proc = run_install("--client", "codex")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(path.read_text(encoding="utf-8"), legacy, "安装其他单客户端不得触发清理")
 
 
 if __name__ == "__main__":

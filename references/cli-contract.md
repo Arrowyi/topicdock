@@ -56,7 +56,7 @@ Every command startup runs the seven-step self-heal under an exclusive lock (rep
 
 - `topic_id`: `^[a-z0-9][a-z0-9-]{0,63}$`, immutable after creation; `title`: any language, changeable anytime (empty/absent = keep/inherit).
 - `actor` normalization: `null`/whitespace → `""` (never stored as `"None"`); `model` (optional): `null`/absent/whitespace-after-`strip()` → key not written; a non-`None`, non-`str` value → `INVALID_INPUT` (exit code 7); stored as the `strip()`-ed value; a new hop never inherits the parent hop's `model`; on `--amend` a non-empty string updates it, absent/whitespace keeps the original.
-- `base_hop: null` = create a new topic (scenario 1); `base_sha` rule (D-P26): full 64-hex equality, or >=12 chars forming a prefix of the current `topics.md_sha256`.
+- `base_hop: null` = create a new topic (scenario 1); the response then carries an optional `similar_topics` key — `[{topic_id, title, score}]`, 0..3 **existing** topics with `score >= 35` in descending score order, computed before the write from the payload `title` (or `topic_id` fallback) as a single query phrase; `[]` = computed with no similar topic, key omitted = the computation failed (fail-open, creation unaffected and exit code unchanged) or the save is not a new-topic path; `base_sha` rule (D-P26): full 64-hex equality, or >=12 chars forming a prefix of the current `topics.md_sha256`.
 - **`--fork-as <new_id>`**: the payload `topic_id` = the source topic id, `--fork-as` = the new id (regex-valid and nonexistent); source = the state at base_hop (ancestor forks skip the sha check); the new first hop gets `parents=[base_hop]` and all items copied as `op=inherit, origin=src:item@<initial-creation-hop>` + the payload's mutations stacked in the same hop; combining with `--amend`/`--force-merge` is always `INVALID_INPUT`.
 - `artifacts` flow: omitted/`null` → inherit the base_hop snapshot; `[]` → clear; a new list → update and prune dead links (D-P33).
 - `fold` preconditions: every `from_items` entry exists and is `[x]`, otherwise `INVALID_INPUT`.
@@ -83,7 +83,7 @@ Payload mutations are normalized into a HopBlock sequence and pass one by one th
 | Command | Success payload fields |
 |---|---|
 | `init` | `status/store_dir/scope/created(bool)` |
-| `save` | `status/topic_id/head_hop/base_sha(full 64 hex)/amend/degraded/created{track:n}/echo(⚓ line)/conflicts[]/overwritten[]`; on fork success `topic_id` = the new id |
+| `save` | `status/topic_id/head_hop/base_sha(full 64 hex)/amend/degraded/created{track:n}/echo(⚓ line)/conflicts[]/overwritten[]`; on fork success `topic_id` = the new id; new-topic saves (`base_hop: null`) additionally carry `similar_topics[{topic_id,title,score}]` (0..3 existing topics, score ≥ 35 descending; `[]` = none; key omitted on computation failure, fail-open), rendered through the generic key/value output rendering in both `--json` and human-readable modes |
 | `use` | `status/topic_id/text(md full text)/head_hop/base_sha(full)/artifacts[{name,path,note,status: ok\|missing\|moved,new_path?}]`; with `--trace` also `traces{...}`; no selector and 0 topics → `{status, topic_id: null, note}`; >=2 → first-page list fields + `hint` |
 | `list` | `status/page/page_size/total/items[{index,topic_id,title,updated_at}]` |
 | `match` | `status/results[{topic_id,score,title,full(bool),text?(top-5 full text),head_hop?,base_sha?,artifacts?,traces?}]` (`head_hop`/`base_sha`/`artifacts` attach to the top <=5 `full: true` items; `traces` additionally when `--trace` is given) |

@@ -120,6 +120,132 @@ class TestSaveNewTopic(TopicDockTestCase):
         self.assertEqual(data["status"], "INVALID_INPUT")
 
 
+class TestSimilarTopicsHint(TopicDockTestCase):
+    """M2：base_hop=null 新建 save 附 similar_topics 非阻断提示（fail-open）。"""
+
+    def test_near_same_title_new_topic_hits_existing(self):
+        """① 近同题 title 新建 → 含既有题 alpha（score ≥ 35，字段齐全）。"""
+        store = make_store()
+        code, first, _ = _new_topic(
+            store, self.tmp_root, topic_id="alpha", title="auth jwt refactor plan"
+        )
+        self.assertEqual(code, 0)
+        code, data, _ = _new_topic(
+            store, self.tmp_root, topic_id="beta",
+            title="auth jwt refactor plan review",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(data["similar_topics"], [
+            {"topic_id": "alpha", "title": "auth jwt refactor plan", "score": 60},
+        ])
+
+    def test_unrelated_title_returns_empty_list(self):
+        """② 与既有题零共享词组的无关 title → []。"""
+        store = make_store()
+        code, first, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        code, data, _ = _new_topic(
+            store, self.tmp_root, topic_id="beta", title="zzz qqq 777"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(data["similar_topics"], [])
+
+    def test_empty_store_first_creation_self_excluded(self):
+        """③ 空库首次新建 → [] 且不含自身（自排除回归钉）。"""
+        store = make_store()
+        code, data, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        self.assertEqual(data["similar_topics"], [])
+
+    def test_non_new_paths_omit_key(self):
+        """④ 常规续跳 / 对既有题带有效 base_hop 的 --amend / --fork-as → 无键。"""
+        store = make_store()
+        code, data, _ = _new_topic(store, self.tmp_root)
+        sha = data["base_sha"]
+        code, data = run_save(store, {
+            "topic_id": "alpha", "base_hop": "H001", "base_sha": sha,
+            "session_id": "ses-02", "mutations": [
+                {"op": "create", "track": "C", "statement": "续跳结论"}]},
+            self.tmp_root)
+        self.assertEqual(code, 0)
+        self.assertNotIn("similar_topics", data)
+        code, data = run_save(store, {
+            "topic_id": "alpha", "base_hop": "H002", "base_sha": data["base_sha"],
+            "session_id": "ses-02", "mutations": [
+                {"op": "create", "track": "C", "statement": "amend 结论"}]},
+            self.tmp_root, "--amend")
+        self.assertEqual(code, 0)
+        self.assertNotIn("similar_topics", data)
+        code, data = run_save(store, {
+            "topic_id": "alpha", "base_hop": "H002", "base_sha": data["base_sha"],
+            "session_id": "ses-03", "mutations": []},
+            self.tmp_root, "--fork-as", "gamma")
+        self.assertEqual(code, 0)
+        self.assertNotIn("similar_topics", data)
+
+    def test_match_topics_failure_fails_open(self):
+        """⑤ match_topics 注入 RuntimeError → 退出码 0、字段完整、键缺省。"""
+        store = make_store()
+        code, first, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        with mock.patch.object(
+            topicdock, "match_topics",
+            side_effect=RuntimeError("injected"),
+        ):
+            code, data, _ = _new_topic(
+                store, self.tmp_root, topic_id="beta",
+                title="auth jwt refactor plan",
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(data["status"], "OK")
+        self.assertEqual(data["topic_id"], "beta")
+        self.assertEqual(data["head_hop"], "H002")
+        self.assertRegex(data["base_sha"], r"^[0-9a-f]{64}$")
+        self.assertIn("echo", data)
+        self.assertNotIn("similar_topics", data)
+        self.assertTrue((Path(store) / "topics" / "beta.md").is_file())
+
+    def test_key_present_existing_fields_unchanged(self):
+        """⑥ 带键成功新建 → 既有字段与退出码逐一不变（显式断言）。"""
+        store = make_store()
+        code, first, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        code, data, _ = _new_topic(
+            store, self.tmp_root, topic_id="beta",
+            title="auth jwt refactor plan",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(data["status"], "OK")
+        self.assertEqual(data["topic_id"], "beta")
+        self.assertEqual(data["head_hop"], "H002")
+        self.assertFalse(data["amend"])
+        self.assertFalse(data["degraded"])
+        self.assertEqual(data["created"], {"C": 1, "R": 1, "Q": 1, "A": 1})
+        self.assertRegex(
+            data["echo"], r"^⚓ TopicDock: beta \(H002@[0-9a-f]{6} 新建 \| "
+            r"\+1\[C\] \+1\[R\] \+1\[Q\] \+1\[A\]\)$"
+        )
+        self.assertRegex(data["base_sha"], r"^[0-9a-f]{64}$")
+        self.assertEqual(data["conflicts"], [])
+        self.assertEqual(data["overwritten"], [])
+        self.assertIn("similar_topics", data)
+
+    def test_chinese_title_hit(self):
+        """⑦ 中文 title 命中路径（bigram 覆盖率打分）。"""
+        store = make_store()
+        code, first, _ = _new_topic(
+            store, self.tmp_root, topic_id="alpha", title="网关鉴权设计"
+        )
+        self.assertEqual(code, 0)
+        code, data, _ = _new_topic(
+            store, self.tmp_root, topic_id="beta", title="网关鉴权设计评审"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(data["similar_topics"], [
+            {"topic_id": "alpha", "title": "网关鉴权设计", "score": 54},
+        ])
+
+
 class TestSaveAdvance(TopicDockTestCase):
     def test_advance_creates_h002_with_evolved_tags(self):
         store = make_store()

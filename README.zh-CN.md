@@ -41,7 +41,7 @@ td save --stdin --json --amend < payload.json   # 同会话增量：原地更新
 
 ## /topicdock 单命令入口
 
-安装后（见下文），在客户端直接输入 `/topicdock` 即可挂载/切换主题（单一命令，不用命令族）：
+安装后（见下文），在客户端直接输入 `/topicdock` 即可挂载/切换主题（单一命令，不用命令族）。该命令入口仅随 `claude` / `opencode` 安装；Cursor 由 skill 自身承载斜杠入口（Cursor 2.4+），不再生成命令文件：
 
 - **带参直通**：`/topicdock <id|序号>` → 直接调 `td use <id|序号>` 挂载目标主题，返回账本正文后按三支柱工作流继续。
 - **无参引导**：`/topicdock` → 调 `td use` 无参引导流，按库内主题数分三种情形：
@@ -62,11 +62,10 @@ td save --stdin --json --amend < payload.json   # 同会话增量：原地更新
 |---|---|
 | `claude` | `~/.claude/commands/topicdock.md` |
 | `opencode` | `~/.config/opencode/commands/topicdock.md` |
-| `cursor` | `~/.cursor/commands/topicdock.md` |
 
 同名文件含该哨兵 → 属 TopicDock 管理（重装覆盖升级、卸载删除）；不含 → 外来文件，安装时提示跳过、**绝不静默覆盖**，卸载也不动。
 
-`codex` 不安装命令模板，因为 Codex 已弃用 custom prompts（自定义 slash 命令），改由 Agent Skills 承载可复用提示。因此 `codex` 使用技能目录加 `<cwd>/AGENTS.md` 中的守则块。
+`codex` 不安装命令模板，因为 Codex 已弃用 custom prompts（自定义 slash 命令），改由 Agent Skills 承载可复用提示。因此 `codex` 使用技能目录加 `<cwd>/AGENTS.md` 中的守则块。`cursor` 同理：Cursor 2.4 起斜杠入口由 skills 承载，TopicDock 不再安装 cursor 命令文件；安装/卸载 `cursor`（或 `all`）时会自动清理含 TopicDock 哨兵的遗留 `~/.cursor/commands/topicdock.md`（安装清理命中打印一行提示、卸载静默清理），外来或不可读文件一律不动；安装其他单客户端不触发该清理，`--dest` 模式下清理仅作用 `<dest>/cursor/commands`。
 
 ## 安装指南
 
@@ -81,6 +80,7 @@ curl -fsSL https://raw.githubusercontent.com/Arrowyi/topicdock/main/scripts/inst
 - 想先审查脚本再执行：`curl -fsSL https://raw.githubusercontent.com/Arrowyi/topicdock/main/scripts/install.sh | less`（纯文本，无压缩无混淆）。
 - 在 AI Agent（Claude Code / Cursor / OpenCode / Codex）聊天里，把上面这条命令原样粘贴发送即可，Agent 会执行它完成安装。
 - 可选参数：`... | bash -s -- --client cursor`（只装/升级指定客户端；不带参数时自动升级本机已装客户端，一个都没装过时会打印四客户端示例命令并以退出码 2 结束，请带 `--client` 重跑）。
+- 安装/卸载 `cursor`（或 `all`）时会自动清理含 TopicDock 哨兵的遗留 `~/.cursor/commands/topicdock.md`（Cursor 2.4 起斜杠入口由 skills 承载）；安装其他单客户端不触发该清理。
 - 安装会把常驻唤醒守则块注入**当前工作目录**下的 `<cwd>/AGENTS.md`（`claude` 为 `<cwd>/CLAUDE.md`）。请在项目根目录运行安装命令，这样守则才会落在你项目根的 `AGENTS.md` / `CLAUDE.md` 里。注入内容含你本机的引擎调用路径，幂等可重入；卸载时按其余已装客户端探测式保留或移除。
 
 **从源码安装**，克隆仓库后运行：
@@ -93,7 +93,7 @@ python3 scripts/install.py --client claude|opencode|cursor|codex|all [--dest <di
 
 1. 把 `SKILL.md`、`references/` 和 `scripts/topicdock.py` 复制到对应客户端的技能目录。
 2. 向 `<cwd>/CLAUDE.md`（`claude`）或 `<cwd>/AGENTS.md`（`opencode` / `cursor` / `codex`）幂等注入常驻唤醒守则块。
-3. 把 `/topicdock` 命令模板安装到下表位置。`--dest <dir>` 表示装到默认客户端位置之外的目录，同时把命令模板根重定向到 `<dest>/<client>/commands/`，并跳过全局库的创建。
+3. 把 `/topicdock` 命令模板安装到下表位置。`--dest <dir>` 表示装到默认客户端位置之外的目录，同时把命令模板根重定向到 `<dest>/<client>/commands/`，并跳过全局库的创建。安装/卸载 `cursor`（或 `all`）时还会自动清理遗留哨兵命令文件；`--dest` 模式下该清理仅作用 `<dest>/cursor/commands`。
 4. 在 `~/.local/bin/td` 建立指向已安装引擎的符号链接（该目录需在 `PATH` 中；不可写时会打印 `alias` 提示）。
 5. 未指定 `--dest` 时，末尾自动建立/确认全局库 `~/.topicdock/`（幂等）。
 
@@ -105,7 +105,7 @@ python3 scripts/install.py --client claude|opencode|cursor|codex|all [--dest <di
 |---|---|---|
 | `claude` | `~/.claude/skills/topicdock` | `~/.claude/commands/topicdock.md` |
 | `opencode` | `~/.config/opencode/skills/topicdock` | `~/.config/opencode/commands/topicdock.md` |
-| `cursor` | `~/.cursor/skills/topicdock` | `~/.cursor/commands/topicdock.md` |
+| `cursor` | `~/.cursor/skills/topicdock` | 无（安装时自动清理） |
 | `codex` | `<cwd>/.agents/skills/topicdock` | 无（Codex 已弃用 custom prompts） |
 
 说明：
@@ -169,7 +169,7 @@ td trace auth-refactor C1
 | `td init` | `--scope global\|local [--path <dir>]` | 初始化存储库，幂等 |
 | `td use` | `[<topic_id\|index>] [--trace <auto\|items>]` | 挂载主题，返回账本全文 + `(head_hop, base_sha)`；无参时按库内主题数引导；可选 `--trace auto` 同轮内联全部未决 `[Q]` 与断点 `[~][A]` 的完整历史块 |
 | `td match` | `[--topic <kw> [--topic <kw2> …]] [--threshold 35] [--recent] [--trace <auto\|items>]` | 关键词打分召回（同分按 `updated_at` 倒序、`topic_id` 升序）；`--recent` 免 `--topic` 直接取最近 ≤ 5 个；前 5 命中（`full: true`）直接附挂载凭证 `head_hop`/完整 `base_sha`/`artifacts`，单次 match 即完成挂载，第 6 项起不附 |
-| `td save` | `--stdin \| --json-file <path> [--amend] [--fork-as <new_id>] [--force-merge]` | 唯一权威写入入口，带乐观并发校验；载荷可选 `model` 字符串（新建跳缺省不落键，`--amend` 缺省保留原值） |
+| `td save` | `--stdin \| --json-file <path> [--amend] [--fork-as <new_id>] [--force-merge]` | 唯一权威写入入口，带乐观并发校验；载荷可选 `model` 字符串（新建跳缺省不落键，`--amend` 缺省保留原值）。以 `base_hop: null` 新建主题时，响应额外携带可选的 `similar_topics` 提示（0-3 条既有主题，score ≥ 35 按分降序），经通用键值渲染呈现；它是非阻断的核对辅助，绝不改变退出码或创建本身 |
 | `td merge` | `<src_topic_id> <dst_topic_id> [--summary "..."] [--session-id] [--actor] [--model] [--next-focus]` | 跨主题合流：src 条目并入 dst，trace 不断链（`--actor`/`--model` 默认 `""`） |
 | `td trace` | `<topic_id> <item_id> [<item2> …]` | 拉取条目的全部历史证据块，已推翻/已折叠/已合流项同样可查；支持单次多条目（空格/逗号分隔如 `C1,C2,Q3`，单条目输出与旧版完全一致） |
 | `td list` | `[--page P] [--page-size 10] [--all] [--filter "<kw>"]` | 分页列出主题，按 `updated_at` 倒序 |

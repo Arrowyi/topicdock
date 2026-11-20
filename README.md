@@ -50,7 +50,7 @@ td save --stdin --json --amend < payload.json   # same-session increment: update
 
 ## The /topicdock Command
 
-After installation, type `/topicdock` in your client to mount or switch topics. It is one command, not a command family.
+After installation, type `/topicdock` in your client to mount or switch topics. It is one command, not a command family. The command entry is installed only for `claude` and `opencode`; on Cursor the skill itself carries the slash entry (Cursor 2.4+), so no command file is generated there.
 
 - **Direct mount with an argument.** `/topicdock <id|index>` calls `td use <id|index>` to mount that topic. The agent receives the ledger text and continues with the three-pillar workflow.
 - **Guided flow without an argument.** `/topicdock` calls `td use` with no argument, and what you see depends on how many topics the store holds:
@@ -71,11 +71,10 @@ The single source of truth for the command is `scripts/templates/topicdock-comma
 |---|---|
 | `claude` | `~/.claude/commands/topicdock.md` |
 | `opencode` | `~/.config/opencode/commands/topicdock.md` |
-| `cursor` | `~/.cursor/commands/topicdock.md` |
 
 A file with the same name that contains the sentinel is managed by TopicDock. Reinstalling upgrades it and uninstalling removes it. A file without the sentinel is a foreign file. The installer warns and skips it, so it is never silently overwritten, and uninstall leaves it alone.
 
-`codex` does not get a command template, because Codex has deprecated custom prompts (custom slash commands) in favor of Agent Skills. Codex therefore uses the skill directory plus the rule block in `<cwd>/AGENTS.md`.
+`codex` does not get a command template, because Codex has deprecated custom prompts (custom slash commands) in favor of Agent Skills. Codex therefore uses the skill directory plus the rule block in `<cwd>/AGENTS.md`. The same applies to `cursor`: since Cursor 2.4, skills carry the slash entry, so TopicDock installs no cursor command file. Installing or uninstalling `cursor` (or `all`) automatically removes a legacy `~/.cursor/commands/topicdock.md` when it carries the TopicDock sentinel — install prints a one-line hint on removal, uninstall cleans it up silently — and foreign or unreadable files are left untouched. Installing other single clients does not trigger this cleanup; in `--dest` mode the cleanup only touches `<dest>/cursor/commands`.
 
 ## Installation
 
@@ -90,6 +89,7 @@ curl -fsSL https://raw.githubusercontent.com/Arrowyi/topicdock/main/scripts/inst
 - To read the script before running it, pipe it to a pager instead: `curl -fsSL https://raw.githubusercontent.com/Arrowyi/topicdock/main/scripts/install.sh | less`. It is plain text, not compressed or obfuscated.
 - In an AI agent chat (Claude Code, Cursor, OpenCode, Codex), paste the command as-is. The agent runs it and completes the install.
 - To install or upgrade a specific client, add the optional flag: `... | bash -s -- --client cursor`. With no arguments, the script upgrades the clients already installed on your machine. If none has ever been installed, it prints example commands for all four clients and exits with code 2. Re-run it with `--client`.
+- Installing or uninstalling `cursor` (or `all`) also automatically removes a legacy `~/.cursor/commands/topicdock.md` when it carries the TopicDock sentinel (Cursor 2.4+ carries the slash entry via skills); installing other single clients does not trigger this cleanup.
 - The install injects a resident wake-up rule block into `<cwd>/AGENTS.md` in your **current working directory** (`<cwd>/CLAUDE.md` for `claude`). Run the installer from your project root so the rules land in your project's root `AGENTS.md` / `CLAUDE.md`. The block includes the engine call path for your machine, and injection is idempotent, so re-running it is safe. On uninstall, the block is kept or removed depending on whether other installed clients still need it.
 
 **Install from source.** Clone the repository and run:
@@ -102,7 +102,7 @@ python3 scripts/install.py --client claude|opencode|cursor|codex|all [--dest <di
 
 1. Copies `SKILL.md`, `references/`, and `scripts/topicdock.py` into the client's skill directory.
 2. Idempotently injects the resident wake-up rule block into `<cwd>/CLAUDE.md` (`claude`) or `<cwd>/AGENTS.md` (`opencode` / `cursor` / `codex`).
-3. Installs the `/topicdock` command template (see the table below). `--dest <dir>` installs somewhere other than the default client locations, redirects command templates to `<dest>/<client>/commands/`, and skips creating the global store.
+3. Installs the `/topicdock` command template (see the table below). `--dest <dir>` installs somewhere other than the default client locations, redirects command templates to `<dest>/<client>/commands/`, and skips creating the global store. Installing or uninstalling `cursor` (or `all`) also auto-cleans a legacy sentinel command file; in `--dest` mode that cleanup only touches `<dest>/cursor/commands`.
 4. Creates a symlink at `~/.local/bin/td` pointing to the installed engine. That directory must be on your `PATH`. If it is not writable, the installer prints an `alias` suggestion instead.
 5. Unless `--dest` is set, creates or confirms the global store `~/.topicdock/` at the end (idempotent).
 
@@ -114,7 +114,7 @@ Where each client's skill and command template go (the `--client` values match t
 |---|---|---|
 | `claude` | `~/.claude/skills/topicdock` | `~/.claude/commands/topicdock.md` |
 | `opencode` | `~/.config/opencode/skills/topicdock` | `~/.config/opencode/commands/topicdock.md` |
-| `cursor` | `~/.cursor/skills/topicdock` | `~/.cursor/commands/topicdock.md` |
+| `cursor` | `~/.cursor/skills/topicdock` | none — auto-cleaned on install |
 | `codex` | `<cwd>/.agents/skills/topicdock` | none (Codex custom prompts are deprecated) |
 
 Notes:
@@ -178,7 +178,7 @@ The `echo` field returned by `td save` and `td merge` is the authoritative sourc
 | `td init` | `--scope global\|local [--path <dir>]` | Initialize a store. Idempotent. |
 | `td use` | `[<topic_id\|index>] [--trace <auto\|items>]` | Mount a topic. Returns the full ledger and `(head_hop, base_sha)`. With no argument, it guides you based on how many topics exist. Optional `--trace auto` inlines, in the same turn, the full history blocks of all open `[Q]` items and `[~][A]` breakpoints. |
 | `td match` | `[--topic <kw> [--topic <kw2> …]] [--threshold 35] [--recent] [--trace <auto\|items>]` | Keyword scoring and recall. Ties are ordered by `updated_at` descending, then `topic_id` ascending. `--recent` skips `--topic` and returns the most recent topics (up to 5). The first 5 hits (`full: true`) carry the mount credentials `head_hop` / full `base_sha` / `artifacts`, so one match completes the mount; from the 6th on they are not attached. |
-| `td save` | `--stdin \| --json-file <path> [--amend] [--fork-as <new_id>] [--force-merge]` | The one authoritative write entry, with optimistic concurrency checking. The payload accepts an optional `model` string (omitted on new hops when blank; preserved on `--amend` when omitted). |
+| `td save` | `--stdin \| --json-file <path> [--amend] [--fork-as <new_id>] [--force-merge]` | The one authoritative write entry, with optimistic concurrency checking. The payload accepts an optional `model` string (omitted on new hops when blank; preserved on `--amend` when omitted). When creating a new topic (`base_hop: null`), the response also carries an optional `similar_topics` hint (0-3 existing topics with score ≥ 35, descending) rendered through the generic key/value output; it is a non-blocking check aid and never changes the exit code or the creation itself. |
 | `td merge` | `<src_topic_id> <dst_topic_id> [--summary "..."] [--session-id] [--actor] [--model] [--next-focus]` | Cross-topic merge. Items from `src` are merged into `dst` and trace links stay unbroken. `--actor` and `--model` default to `""`. |
 | `td trace` | `<topic_id> <item_id> [<item2> …]` | Pull every historical evidence block of an item. Overturned, folded, and merged items can still be traced. Multiple items in one call (space or comma separated, e.g. `C1,C2,Q3`); single-item output is identical to the previous version. |
 | `td list` | `[--page P] [--page-size 10] [--all] [--filter "<kw>"]` | List topics in pages, ordered by `updated_at` descending. |

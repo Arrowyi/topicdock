@@ -1089,6 +1089,20 @@ def _save_fork(store, conn, payload, topic_id, row, chain, rep, base_hop, fork_a
     }
 
 
+def _similar_topics_hint(conn, payload, topic_id):
+    """新建主题时的 similar_topics 非阻断提示（fail-open：异常返回 None 省略键）。"""
+    try:
+        title = str(payload.get("title") or topic_id)  # 与 _save_new_topic 同口径
+        scored = match_topics(conn, [title])
+        return [
+            {"topic_id": entry["topic_id"], "title": entry["title"], "score": entry["score"]}
+            for entry in scored[:3]
+            if entry["score"] >= 35 and entry["topic_id"] != topic_id
+        ]
+    except Exception:
+        return None
+
+
 def _save_locked(store, conn, payload, amend, fork_as, force_merge):
     actor = _normalize_actor(payload.get("actor"))
     model = _normalize_model(payload.get("model"))
@@ -1131,7 +1145,11 @@ def _save_locked(store, conn, payload, amend, fork_as, force_merge):
             raise TopicNotFoundError(f"源主题不存在: {topic_id}")
         if base_hop is not None:
             raise TopicNotFoundError(f"主题不存在: {topic_id}")
-        return _save_new_topic(store, conn, payload, topic_id, actor, model)
+        similar = _similar_topics_hint(conn, payload, topic_id)  # 写路径前计算，fail-open
+        result = _save_new_topic(store, conn, payload, topic_id, actor, model)
+        if similar is not None:
+            result["similar_topics"] = similar
+        return result
 
     head = row["head_hop"]
     if head_missing:

@@ -11,13 +11,13 @@
 
 四个客户端各用独立技能目录；codex 采用官方项目级技能根 <cwd>/.agents/skills。
 
-claude / opencode / cursor 另安装 `/topicdock` 单命令模板
-（单一事实源 scripts/templates/topicdock-command.md）；codex 无命令模板
-（官方已弃用 custom prompts 机制，可复用提示改由 Agent Skills 承载）：
+claude / opencode 另安装 `/topicdock` 单命令模板
+（单一事实源 scripts/templates/topicdock-command.md）；codex 与 cursor 均无命令模板
+（codex：官方已弃用 custom prompts；cursor：2.4 起 skills 承载斜杠入口，安装/卸载
+cursor 时自动清理含哨兵的遗留旧命令文件）：
 
 - claude   → ~/.claude/commands/topicdock.md
 - opencode → ~/.config/opencode/commands/topicdock.md
-- cursor   → ~/.cursor/commands/topicdock.md
 
 - `--dest <dir>` 同时覆盖该 client 的 skills 根目录（目标仍为 <dest>/topicdock）
   与命令模板根（<dest>/<client>/commands/topicdock.md）；并跳过全局库自动初始化。
@@ -28,11 +28,14 @@ claude / opencode / cursor 另安装 `/topicdock` 单命令模板
   （文件其余内容不动）。
 - 命令模板所有权判据 = 目标文件含固定哨兵行 `<!-- topicdock:command-managed -->`：
   含 → 本工具管理（安装覆盖升级、卸载删除）；不含 → 外来同名文件（提示跳过，
-  绝不静默覆盖，卸载也不动）。
+  绝不静默覆盖，卸载也不动）。cursor 遗留命令文件按同一哨兵判定自愈：安装/卸载
+  cursor（或 all）时仅含哨兵才自动清理（安装清理打印提示、卸载静默），外来或
+  不可读（非 UTF-8）文件一律不动、安装与卸载均不中断。
 - `~/.local/bin` 可写时建立 `td` 符号链接指向已安装的 topicdock.py；
   不可写时打印一行 alias 指引。
-- `--uninstall` 反向清理：删自身技能目录、删含哨兵的命令模板、解除记忆文件中的
-  守则块、删符号链接（数据库永不删除）。守则块归属按记忆文件判定：
+- `--uninstall` 反向清理：删自身技能目录、删含哨兵的命令模板（含 cursor 遗留
+  哨兵文件）、解除记忆文件中的守则块、删符号链接（数据库永不删除）。守则块归属
+  按记忆文件判定：
   - `<cwd>/CLAUDE.md` 块仅属 claude，claude 卸载时无条件移除；
   - `<cwd>/AGENTS.md` 块由 opencode / cursor / codex 共注，卸载其中任一客户端时，
     移除自身技能目录后探测其余客户端技能目录（opencode `~/.config/opencode/skills/topicdock`、
@@ -58,7 +61,8 @@ _BUILD = _REPO_ROOT / "scripts" / "build.py"
 _TEMPLATE = _REPO_ROOT / "scripts" / "templates" / "topicdock-command.md"
 
 CLIENTS = ("claude", "opencode", "cursor", "codex")
-_COMMAND_CLIENTS = ("claude", "opencode", "cursor")  # codex 无命令模板
+# cursor 已下线命令模板：Cursor 2.4 起 skills 承载斜杠入口，仅 claude/opencode 安装
+_COMMAND_CLIENTS = ("claude", "opencode")
 _AGENTS_CLIENTS = ("opencode", "cursor", "codex")  # 守则块注入 <cwd>/AGENTS.md
 
 SENTINEL_BEGIN = "<!-- topicdock:begin -->"
@@ -167,13 +171,44 @@ def _install_command_template(client: str, dest: str | None, notes: list[str]) -
 
 
 def _uninstall_command_template(client: str, dest: str | None) -> None:
-    """卸载 /topicdock 命令模板：仅删除含哨兵的文件；外来文件不动。"""
+    """卸载 /topicdock 命令模板：仅删除含哨兵的文件；外来文件不动。
+
+    不可读（非 UTF-8）文件同样按外来文件处理：不删、跳过、不中断卸载。
+    """
     target = _client_commands_root(client, dest) / "topicdock.md"
     try:
         if target.is_file() and COMMAND_SENTINEL in target.read_text(encoding="utf-8"):
             target.unlink()
+    except UnicodeDecodeError:
+        return
     except OSError as exc:
         raise Unwritable(f"卸载 {client} 命令模板失败: {exc}") from exc
+
+
+def _cleanup_legacy_cursor_command(dest: str | None, notes: list[str]) -> None:
+    """清理 cursor 遗留命令模板（命令模板已下线，斜杠入口改由 skills 承载）。
+
+    经 _client_commands_root 定位：文件不存在或不含哨兵（外来文件）→ 跳过不动；
+    含 COMMAND_SENTINEL → 删除并向 notes 追加一行提示（含路径与去向说明）；
+    读取或删除遇 OSError / UnicodeDecodeError → 不删并降级提示，安装绝不中断。
+    """
+    target = _client_commands_root("cursor", dest) / "topicdock.md"
+    try:
+        if not target.is_file():
+            return
+        if COMMAND_SENTINEL not in target.read_text(encoding="utf-8"):
+            return
+        target.unlink()
+    except (OSError, UnicodeDecodeError):
+        notes.append(
+            f"提示: {target} 读取或删除失败，已保留原样"
+            f"（可能为外来或非 UTF-8 文件）；TopicDock 不再管理 cursor 命令模板。"
+        )
+        return
+    notes.append(
+        f"提示: 已清理遗留命令模板 {target}；Cursor 2.4 起斜杠入口由 skills 承载，"
+        "TopicDock 不再安装 cursor 命令模板。"
+    )
 
 
 def _ensure_engine() -> None:
@@ -354,6 +389,8 @@ def install(args: argparse.Namespace) -> tuple[int, list[str]]:
         engine_targets.append(_install_skill_dir(client, args.dest))
         if client in _COMMAND_CLIENTS:
             _install_command_template(client, args.dest, notes)
+        if client == "cursor":  # cursor 已无命令模板：改为清理历史版本遗留的哨兵文件
+            _cleanup_legacy_cursor_command(args.dest, notes)
         try:
             _inject_block(_memory_file(client), engine_targets[-1])
         except OSError as exc:
@@ -375,6 +412,9 @@ def uninstall(args: argparse.Namespace) -> tuple[int, list[str]]:
                 shutil.rmtree(target)
             if client in _COMMAND_CLIENTS:
                 _uninstall_command_template(client, args.dest)
+        if "cursor" in selected:
+            # cursor 已退出 _COMMAND_CLIENTS（命令模板下线），显式补调以清理遗留哨兵文件
+            _uninstall_command_template("cursor", args.dest)
         if "claude" in selected:
             _remove_block(_memory_file("claude"))  # CLAUDE.md 块仅属 claude
         if any(client in _AGENTS_CLIENTS for client in selected):
