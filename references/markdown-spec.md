@@ -1,6 +1,6 @@
 # TopicDock Dual Markdown Syntax Specification (`topics/<id>.md` and `hops/hop-NNN.md`)
 
-This file is the written form of design §4.2: per-field syntax of both templates, anti-injection escaping rules, the trailing short-tag downgrade chain, and numbering watermarks. **Current `SUPPORTED_SCHEMA_VERSION = 1`**; reading `schema_version > 1` or a hop header `v > 1` is rejected with `UNSUPPORTED_SCHEMA_VERSION` (exit code 6) before any write/delete.
+This specification defines the per-field syntax of both templates, anti-injection escaping rules, the trailing short-tag downgrade chain, and numbering watermarks. **Current `SUPPORTED_SCHEMA_VERSION = 1`**; reading `schema_version > 1` or a hop header `v > 1` is rejected with `UNSUPPORTED_SCHEMA_VERSION` (exit code 6) before any write/delete.
 
 Global invariant: `parse(render(doc)) == doc` (bidirectional identity). Both the top-level md and hop shards are **writable only via `td` commands**; any manual modification counts as file corruption (self-healing: see the `doctor` section in `references/cli-contract.md`).
 
@@ -53,7 +53,7 @@ next_seq: {"C":4,"R":2,"Q":2,"A":4}
 - [~] [auth-refactor:A2] 编写 `design.md` 接口契约与错误码定义 — 断点: 待敲定 Q1 回调签名头格式 (H004)
 - [ ] [auth-refactor:A3] 交由 coder 实施中间件与集成测试 (H004)
 
-## 3. 关联文件链接 (Artifact Links)
+## 3. 关联文件链接
 - 网关架构设计记录: /abs/path/to/design.md — 定义 JWT 载荷字段与公钥轮换接口
 
 ## 4. 最新一跳 (Latest Hop)
@@ -83,7 +83,7 @@ For `[C<n>]` and `[A<n>]`: take all associated hop ids `[h1..hm]` from `item_hop
 
 For `[R<n>]`: a directly created rejected item follows the C/A forms above; one moved in by overturning an original conclusion `[C<k>]` is tagged `(原立<origin_hop>→推翻<overturn_hop>)` (where `origin_hop` is fixed to the hop id where the original conclusion was first created, i.e. `seq_order=1`).
 
-### 2.2 Full-form downgrade chain (D-P30/D4)
+### 2.2 Full-form downgrade chain
 
 The downgrade chain applies to **all forms** (m=1/2/3, m>3, R track); beyond 20 chars or 32 bytes it degrades in this order:
 
@@ -119,30 +119,30 @@ The first line is always: `<!-- topicdock-hop: <canonical-json> -->` — `json.d
 }
 ```
 
-- **Optional provenance field `model`** (a `v: 1` forward-compatible optional key): records the model identifier used for this hop; `actor` records only the acting principal and no longer appends an `@<model>` suffix.
-  - Written only when the `td save` payload `"model"` (or `td merge --model`) is a non-empty string (non-empty after `strip()`); missing / `null` / whitespace-only counts as absent and **the `"model"` key is not written** (legacy hops and saves without `model` keep identical bytes and `sha256`). A non-`None`, non-`str` value → `INVALID_INPUT` (exit code 7).
+- **Optional provenance field `model`** (a `v: 1` forward-compatible optional key): records the model identifier used for this hop; `actor` records only the acting principal (never an `@<model>` suffix).
+  - Written only when the `td save` payload `"model"` (or `td merge --model`) is a non-empty string (non-empty after `strip()`); missing / `null` / whitespace-only counts as absent and **the `"model"` key is not written** (hops and saves without `model` keep identical bytes and `sha256`). A non-`None`, non-`str` value → `INVALID_INPUT` (exit code 7).
   - Newly created hops (first topic creation, regular new hop, degraded new hop, `--fork-as`, `--force-merge`, `td merge`) do not inherit the parent hop's `model`; on same-hop `--amend`, a non-empty string updates it, while absent/whitespace keeps the existing value.
   - `model` lives only in this JSON comment header line: it never modifies the `topics/<id>.md` `## 4.` line and adds no SQLite column.
 - Parsing **preserves any extra fields** and rendering **passes them through verbatim** (forward compatibility).
 - From the second line the header is followed by the `# Hop H003 — auth-refactor` title line.
 
-#### 3.1.1 The 4 position-independent Merkle identity fields (`v: 1` forward-compatible optional extension, D8)
+#### 3.1.1 The 4 position-independent Merkle identity fields (`v: 1` forward-compatible optional extension)
 
 Hop header fields are strictly decoupled into "store-local routing slots" (`hop_id`, `parents`, `topic_origin`, and the per-block `origin` attribute — rewritable on cross-store import collisions) and "global position-independent Merkle identity" (100% invariant across cross-store renumbering and collision renames). All 6 hop-writing entry points (`_save_new_topic`, `_save_amend`, `_save_fork`, regular `_save_locked`, `_save_force_merge`, `_merge_payload`) route through the single finalizer `_finalize_hop_merkle_header(store, conn, topic_id, header, blocks, chain, rep)`, which writes:
 
-1. **`topic_uid`** (`str`, 32-hex topic lineage id): `uuid.uuid4().hex` on first topic creation (`base_hop: null`) or branch fork (`--fork-as <new_id>`); `td merge <src> <dst>` takes the destination `<dst>`'s `topic_uid`. Regular new hops, `--amend`, and `--force-merge` inherit the most recent non-empty `str` `topic_uid` found along the reachable own chain (walking from `base_hop` toward genesis; on a head break, surviving shards with `topic_origin == topic_id` are scanned in descending hop-number order). Only when the entire reachable own chain consists of legacy hops without `topic_uid` is it deterministically derived from the reachable earliest hop `H_earliest` as `sha256(b"topicdock-topic-uid:v1\0" + compute_hop_oid(H_earliest).encode("utf-8")).hexdigest()[:32]` (on `--amend` of a legacy head, extraction/derivation happens **before** `created_at / summary / blocks` are modified).
-2. **`parent_oids`** (`list[str]`, aligned 1:1 by index with `parents`): for each parent hop `P_i`, always the **live-recomputed** `compute_hop_oid(parent_loaded.hop)` (never a possibly stale cached value); when the parent file is missing on disk (D-P20) the slot is `""` to preserve index alignment; a genesis hop is `[]`.
-3. **`origin_oids`** (`dict[str, str]`, optional — the key is written only when this hop's `blocks` contain a non-empty `block.origin`; omitted entirely when empty): `{ "<block.item_id>": "<src_topic_uid>:<src_item_id>@<origin_hop_oid>" }`, resolved via `_parse_origin(block.origin)`; a source store without a persisted `topic_uid` gets a `""` slot (foreign topics are never filled with a derived value); a missing source hop (D-P20) gets `""` in the `origin_hop_oid` slot.
+1. **`topic_uid`** (`str`, 32-hex topic lineage id): `uuid.uuid4().hex` on first topic creation (`base_hop: null`) or branch fork (`--fork-as <new_id>`); `td merge <src> <dst>` takes the destination `<dst>`'s `topic_uid`. Regular new hops, `--amend`, and `--force-merge` inherit the most recent non-empty `str` `topic_uid` found along the reachable own chain (walking from `base_hop` toward genesis; on a head break, surviving shards with `topic_origin == topic_id` are scanned in descending hop-number order). Only when no hop on the reachable own chain carries `topic_uid` is it deterministically derived from the reachable earliest hop `H_earliest` as `sha256(b"topicdock-topic-uid:v1\0" + compute_hop_oid(H_earliest).encode("utf-8")).hexdigest()[:32]` (on `--amend` of a head without `topic_uid`, extraction/derivation happens **before** `created_at / summary / blocks` are modified).
+2. **`parent_oids`** (`list[str]`, aligned 1:1 by index with `parents`): for each parent hop `P_i`, always the **live-recomputed** `compute_hop_oid(parent_loaded.hop)` (never a possibly stale cached value); when the parent file is missing on disk the slot is `""` to preserve index alignment; a genesis hop is `[]`.
+3. **`origin_oids`** (`dict[str, str]`, optional — the key is written only when this hop's `blocks` contain a non-empty `block.origin`; omitted entirely when empty): `{ "<block.item_id>": "<src_topic_uid>:<src_item_id>@<origin_hop_oid>" }`, resolved via `_parse_origin(block.origin)`; a source store without a persisted `topic_uid` gets a `""` slot (foreign topics are never filled with a derived value); a missing source hop gets `""` in the `origin_hop_oid` slot.
 4. **`hop_oid`** (`str`, format `"v1:<64-hex>"` — position-independent pure-function content hash): computed last, over the finalized header + blocks.
 
-**`compute_hop_oid(hop: HopDoc) -> str` (L2 pure function, one non-recursive implementation shared by legacy and new hops)**:
+**`compute_hop_oid(hop: HopDoc) -> str` (L2 pure function, one non-recursive implementation shared by all hops)**:
 - First normalize via `norm_hop = parse_hop_md(render_hop_md(hop))`, then build a **fixed 13-key dictionary** (all top-level keys always present; missing/abnormal values become safe empties `"" / [] / {}`): `v` (int, default 1), `topic_uid`, `title`, `parent_oids`, `session_id`, `created_at`, `actor`, `model` (only non-empty strings, stripped), `summary`, `next_focus`, `artifacts` (list of dicts with `name`/`path`/`note` all stringified), `origin_oids` (`sorted` then `{str: str}`), and `blocks` (in `norm_hop.blocks` order; each block a fixed 7-key dict `item_id / op / status / a_state / from_items / origin_item / fields`, with `origin_item` = `_parse_origin(b.origin)[1]` or `""`, and `fields` stringified in `_HOP_FIELD_ORDER` intersection order).
 - Then `json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")`, prefixed with the domain separator `b"topicdock-hop-oid:v1\0"`, hashed with SHA-256, returned as `"v1:" + hex`.
 - **Position-independence guarantee**: the store-local slots `hop_id`, `parents`, `topic_origin`, the full local `origin` string on blocks, and `hop_oid` itself are excluded from the 13 keys (while the block-level source item id `origin_item` and the top-level `origin_oids` are included), so `compute_hop_oid(hop)` is 100% invariant across cross-store `HNNN` renumbering or collision renames.
 
-**`_load_hop` non-destructive tolerance**: a hop file with any of the 4 fields missing, type-abnormal (e.g. externally written `null`), or with `header["hop_oid"] != compute_hop_oid(hop)` (e.g. a pre-D8 legacy client amending in place without refreshing `hop_oid`) is **never rejected**; the read side safely normalizes to `"" / [] / {}`. When `file_sha256 == db.hops.md_sha256` (i.e. the file passed tamper verification) but the header `hop_oid` disagrees, the live-recomputed `compute_hop_oid(hop)` is the single authority; `td doctor` reports it non-destructively as `hop_oid_drift`. Legacy hops are never rewritten in the background (zero disk churn).
+**`_load_hop` non-destructive tolerance**: a hop file with any of the 4 fields missing, type-abnormal (e.g. externally written `null`), or with `header["hop_oid"] != compute_hop_oid(hop)` (e.g. an external edit or in-place amend that did not refresh `hop_oid`) is **never rejected**; the read side safely normalizes to `"" / [] / {}`. When `file_sha256 == db.hops.md_sha256` (i.e. the file passed tamper verification) but the header `hop_oid` disagrees, the live-recomputed `compute_hop_oid(hop)` is the single authority; `td doctor` reports it non-destructively as `hop_oid_drift`. Hops without the 4 Merkle fields are never rewritten in the background (zero disk churn).
 
-### 3.2 `title` / `artifacts` snapshot flow (D-P33)
+### 3.2 `title` / `artifacts` snapshot flow
 
 - (1) A `td save` payload that omits `artifacts` (or passes `null`) inherits the `base_hop` header snapshot; an explicit `[]` clears it; a new list updates it and **automatically prunes destroyed dead links**.
 - (2) A `td merge <src> <dst>` consolidation hop: `artifacts` is the union of the dst and src latest-hop snapshots (**deduplicated by `path`, order-preserving**); `title` is taken from dst.
@@ -155,10 +155,10 @@ Hop header fields are strictly decoupled into "store-local routing slots" (`hop_
 ```
 
 - `op ∈ {create, update, overturn, resolve, fold, inherit, retract}` (7 kinds); multiple source ids are joined with `+` (e.g. `from=A1+A2+A3`); `origin` carries the initial creation hop of the source item for overturn/resolve/inherit.
-- **Block fields = the full post-operation item snapshot** (`update` carries the full post-state fields, not a delta). The field labels are exact protocol literals: `结论正文` / `一句话依据` (R track: `一句话原因`; A track: `断点`) / `推导与权衡` / `核心证据 (verified)` / `核心证据 (inferred)` / `重审条件` — 8 Chinese field names in total.
+- **Block fields**: `inherit` blocks record the full item snapshot (`_item_fields_snapshot`), while `create`, `update`, `overturn`, `resolve`, and `fold` blocks record the explicitly supplied payload fields (`_save_field_map`); `retract` blocks carry no fields. During replay, `update` modifies only the fields present in the block (`_apply_fields_to_item`). The field labels are exact protocol literals: `结论正文` / `一句话依据` (R track: `一句话原因`; A track: `断点`) / `推导与权衡` / `核心证据 (verified)` / `核心证据 (inferred)` / `重审条件` — 8 Chinese field names in total.
 - Continuation lines of a multi-line field are **uniformly indented by 2 spaces**; a line starting with `### [` is escaped to `\### [` when rendered (prevents cold-rebuild mis-splitting into a new item block).
 
-Full hop example (consistent with design §4.2(3)):
+Full hop example:
 
 ```markdown
 <!-- topicdock-hop: {"actor":"consultant","artifacts":[{"name":"网关架构设计记录","note":"定义 JWT 载荷字段与公钥轮换接口","path":"/abs/path/to/design.md"}],"created_at":"2026-11-16T09:15:00Z","hop_id":"H003","model":"opencode/claude-sonnet-5-5","next_focus":"设计 Refresh Token 吊销机制","parents":["H002"],"session_id":"ses-01","summary":"基于跨区压测推翻 H001 的共享 Session 方案(C1->R1)，确立 EdDSA 短效 JWT(C2)","title":"認證模塊無狀態 JWT 改造與灰度遷移 / Auth Stateless JWT Refactor","topic_origin":"auth-refactor","v":1} -->
@@ -178,7 +178,7 @@ Full hop example (consistent with design §4.2(3)):
 
 ## 4. Numbering watermarks (monotonic no-reuse invariants)
 
-### 4.1 Global hop-number watermark (D-P30 four-source max)
+### 4.1 Global hop-number watermark (four-source max)
 
 ```
 next_hop_seq = max(db.meta.next_hop_seq, .topicdock-meta.max_hop_seq + 1,
@@ -187,13 +187,13 @@ next_hop_seq = max(db.meta.next_hop_seq, .topicdock-meta.max_hop_seq + 1,
 
 `.topicdock-meta.json` is updated whenever a new hop id is allocated; allocation always goes through the engine's `allocate_hop_id` — bypassing it is forbidden.
 
-### 4.2 Per-track numbering watermark inside a topic (D-P30 three-source max)
+### 4.2 Per-track numbering watermark inside a topic (three-source max)
 
 ```
 next_seq[T] = max(frontmatter.next_seq[T], max(topic.md(T)) + 1, max(item_hops(T)) + 1)
 ```
 
-**Storage semantics**: the md frontmatter and the DB `topics.next_seq_json` store the **largest number already used** (not the +1 "next number"); on allocation the engine takes the max of the above and then +1, and the allocated result must never be written back into the md as a watermark (otherwise the crash-adoption `md == render` gate would reject a legitimately in-window md).
+**Storage and allocation semantics**: in normal operation, the md frontmatter `next_seq[T]` and DB `topics.next_seq_json` store the **largest item number already used** on track `T` (updated by `_note_seq` during replay). Before allocating, `next_seq_for_topic` computes the three-source maximum `max(frontmatter.next_seq[T], max(topic.md(T)) + 1, max(item_hops(T)) + 1)`, and `_make_allocator` allocates that value directly (defaulting to `1` when the maximum is `0`) and increments its in-memory counter by `1` for subsequent allocations in the same save. Normal saves never write an unallocated `used + 1` value into `doc.next_seq` (so `render_topic_md(rep.doc)` matches the on-disk md during crash adoption).
 
 ### 4.3 Post-undo md high-watermark semantics
 
@@ -206,13 +206,13 @@ When `td undo` restores an old md, only the **actually restored md** has its fro
 - `.topicdock-meta.json` — persisted watermark `{"schema_version": 1, "max_hop_seq": N}`.
 - `.topicdock.lock` — cross-platform exclusive/shared file lock (POSIX `flock` / Windows `msvcrt`).
 - `.topicdock-undo-pending.json` / `.topicdock-amend-pending.json` — crash-window journals (removed after their transaction commits).
-- **`.topicdock-published.json` — publish seal ledger (D8)**: records hop oids that have been exported/synced, as `{"v": 1, "published_oids": ["v1:<64-hex>", ...]}`. Publishing seals a hop without rewriting any `hop-NNN.md` byte (0 cross-window CAS false conflicts). Reading is fail-closed: a missing file is `(set(), False)`; any parse/shape failure is `(set(), True)`. A sealed head's `--amend` auto-degrades to a new next hop, and `td undo` on a sealed hop — or while the ledger is corrupt — always reports `UNDO_BLOCKED` (exit code 7), which `--force` cannot bypass. The ledger is listed in the store `.gitignore` as machine-local state and is preserved by `doctor --rebuild`.
+- **`.topicdock-published.json` — publish seal ledger**: records hop oids that have been exported/synced, as `{"v": 1, "published_oids": ["v1:<64-hex>", ...]}`. Publishing seals a hop without rewriting any `hop-NNN.md` byte (0 cross-window CAS false conflicts). Reading is fail-closed: a missing file is `(set(), False)`; any parse/shape failure is `(set(), True)`. A sealed head's `--amend` auto-degrades to a new next hop, and `td undo` on a sealed hop — or while the ledger is corrupt — always reports `UNDO_BLOCKED` (exit code 7), which `--force` cannot bypass. The ledger is listed in the store `.gitignore` as machine-local state and is preserved by `doctor --rebuild`.
 - `.gitignore` — written by `td init` with exactly these lines: `topicdock.db*`, `.topicdock.lock`, `*.tmp`, `.topicdock-undo-pending.json`, `.topicdock-amend-pending.json`, `.topicdock-published.json`.
 
 ---
 
-## 6. Known boundaries (design-confirmed residuals, no code change planned)
+## 6. Known boundaries
 
-- **F8 (extreme post-undo `next_seq` scenario)**: the post-undo high watermark lives only in the md frontmatter and the DB topics row — if the DB is **also** corrupted and replayed from the hop chain (cold rebuild), a retracted item's number may be reused; an acceptable extreme, no extra defense added.
-- **F13 residuals**: (1) after a `MISSING` hop is restored, `sha != MISSING` enters the next judging round (handled via the corruption path — converges correctly, one extra round); (2) a crash between "commit and file deletion" is closed by crash adoption (3) plus DB closure (5) in the same round (no dedicated undo entry — accepted loss); (3) the version guard scans all md/hop files on every command (extra I/O); (4) the heal main path has no rebuild retry when it hits `DatabaseError` mid-way; (5) the `quick_check` failure branch has no dedicated test.
-- **M7 (F15) residuals**: (1) startup heal wiring for the undo journal is not implemented — entry rejection (undo reports `INVALID_INPUT` exit 7 while `.topicdock-undo-pending.json` remains; delete the file manually) narrows the un-consumed window to an in-process crash; (2) a no-arg `doctor` on a healthy store reports only `meta_json: ok` (plus the M2 additions `published_ledger` and `hop_oid_drift`, both `ok`); (3) the undo ratchet leaves a +1 hole in retracted track numbers (the price of never-reuse semantics, accepted); (4) the delete-undo payload encodes garbage-file pre-images as base64 bytes, so `json.dumps(ensure_ascii=False)` into a text column may be unreadable in extreme cases (same origin as F13).
+- **Post-undo cold-rebuild watermark boundary**: the post-undo high watermark lives only in the md frontmatter and the DB topics row — if the DB is **also** corrupted and replayed from the hop chain (cold rebuild), a retracted item's number may be reused.
+- **Self-heal and crash-window boundaries**: (1) after a `MISSING` hop is restored, `sha != MISSING` enters the next judging round (handled via the corruption path — converges correctly, one extra round); (2) a crash between "commit and file deletion" is closed by crash adoption (3) plus DB closure (5) in the same round (no dedicated undo entry); (3) the version guard scans all md/hop files on every command (extra I/O); (4) the heal main path has no rebuild retry when it hits `DatabaseError` mid-way; (5) the `quick_check` failure branch has no dedicated test.
+- **Undo journal and doctor boundaries**: (1) startup heal wiring for the undo journal is not implemented — entry rejection (undo reports `INVALID_INPUT` exit 7 while `.topicdock-undo-pending.json` remains; delete the file manually) narrows the un-consumed window to an in-process crash; (2) a no-arg `doctor` on a healthy store reports only `meta_json: ok` (plus `published_ledger` and `hop_oid_drift`, both `ok`); (3) the undo ratchet leaves a +1 hole in retracted track numbers; (4) the delete-undo payload encodes garbage-file pre-images as base64 bytes, so `json.dumps(ensure_ascii=False)` into a text column may be unreadable in extreme cases.
