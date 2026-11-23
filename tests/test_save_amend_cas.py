@@ -120,6 +120,283 @@ class TestSaveNewTopic(TopicDockTestCase):
         self.assertEqual(data["status"], "INVALID_INPUT")
 
 
+class TestSeparatorGuard(TopicDockTestCase):
+    """P4 存期守卫：statement/basis/拼接边界不得内嵌完整条目分隔符（_normalize_mutations）。"""
+
+    PATTERNS = (
+        " — 依据(verified): ",
+        " — 依据(inferred): ",
+        " — 原因: ",
+        " — 断点: ",
+    )
+
+    def _payload(self, mutation, topic_id="guard"):
+        return {
+            "topic_id": topic_id, "title": "守卫主题", "base_hop": None,
+            "base_sha": None, "session_id": "s", "actor": "t", "summary": "首轮",
+            "mutations": [mutation],
+        }
+
+    def _assert_rejected(self, store, payload):
+        code, data = run_save(store, payload, self.tmp_root)
+        self.assertEqual(code, 7)
+        self.assertEqual(data["status"], "INVALID_INPUT")
+        self.assertIn("basis", data.get("error", ""))
+        return data
+
+    def test_statement_patterns_rejected(self):
+        store = make_store()
+        for pattern in self.PATTERNS:
+            with self.subTest(pattern=pattern):
+                self._assert_rejected(store, self._payload({
+                    "op": "create", "track": "Q",
+                    "statement": f"前文{pattern}伪 尾部",
+                }))
+        self.assertFalse((Path(store) / "topics" / "guard.md").exists())
+
+    def test_basis_patterns_rejected(self):
+        store = make_store()
+        for pattern in self.PATTERNS:
+            with self.subTest(pattern=pattern):
+                self._assert_rejected(store, self._payload({
+                    "op": "create", "track": "C", "evidence_status": "verified",
+                    "statement": "正常结论", "basis": f"前文{pattern}伪 尾部",
+                }))
+
+    def test_boundary_basis_without_leading_space_rejected(self):
+        # 无前导空格开头 basis 借结构分隔符尾空格形成高位假分隔符
+        store = make_store()
+        data = self._assert_rejected(store, self._payload({
+            "op": "create", "track": "A", "state": "~",
+            "statement": "行动正文", "basis": "— 断点: 待定",
+        }))
+        self.assertIn("A 轨", data.get("error", ""))
+
+    def test_update_path_guarded_with_item_context(self):
+        store = make_store()
+        code, first, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        data = self._assert_rejected(store, {
+            "topic_id": "alpha", "base_hop": first["head_hop"],
+            "base_sha": first["base_sha"], "session_id": "s2", "actor": "tester",
+            "summary": "推进",
+            "mutations": [{"op": "update", "item_id": "C1",
+                           "statement": "更新 — 原因: 伪"}],
+        })
+        self.assertIn("C1", data.get("error", ""))
+
+    def test_normal_payload_unaffected(self):
+        store = make_store()
+        statement = "结论 —— ； （ ） 「」 · 正常字符"
+        basis = "依据 —— ； （ ） 「」 · 正常字符"
+        code, data = run_save(store, self._payload({
+            "op": "create", "track": "C", "evidence_status": "verified",
+            "statement": statement, "basis": basis,
+        }), self.tmp_root)
+        self.assertEqual(code, 0)
+        self.assertEqual(data["status"], "OK")
+        md_text = (Path(store) / "topics" / "guard.md").read_text(encoding="utf-8")
+        self.assertIn(statement, md_text)
+        self.assertIn(basis, md_text)
+        self.assertNotIn("&#8212;", md_text)
+
+    NEWLINE_BYPASSES = ("\n", "\r")
+
+    def _assert_no_topic(self, store, topic_id):
+        self.assertFalse((Path(store) / "topics" / f"{topic_id}.md").exists())
+        conn = get_or_create_db(_ctx(store))
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM topics WHERE topic_id=?", (topic_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNone(row)
+
+    def test_statement_newline_bypass_rejected(self):
+        # 原始字符串无完整模式，压平后（渲染语义）才形成 → 仍须拒绝
+        store = make_store()
+        for index, newline in enumerate(self.NEWLINE_BYPASSES):
+            with self.subTest(newline=repr(newline)):
+                topic_id = f"nlstmt{index}"
+                self._assert_rejected(store, self._payload({
+                    "op": "create", "track": "Q",
+                    "statement": f"问题{newline}— 原因: 伪",
+                }, topic_id=topic_id))
+                self._assert_no_topic(store, topic_id)
+
+    def test_basis_newline_bypass_rejected(self):
+        store = make_store()
+        for index, newline in enumerate(self.NEWLINE_BYPASSES):
+            with self.subTest(newline=repr(newline)):
+                topic_id = f"nlbasis{index}"
+                self._assert_rejected(store, self._payload({
+                    "op": "create", "track": "C", "evidence_status": "verified",
+                    "statement": "正常结论",
+                    "basis": f"前文{newline}— 依据(verified): 伪",
+                }, topic_id=topic_id))
+                self._assert_no_topic(store, topic_id)
+
+    def test_boundary_newline_bypass_rejected(self):
+        # 压平后 basis 以空格开头，与结构分隔符尾空格拼接出完整模式 → 仍须拒绝
+        store = make_store()
+        for index, newline in enumerate(self.NEWLINE_BYPASSES):
+            with self.subTest(newline=repr(newline)):
+                topic_id = f"nlbnd{index}"
+                self._assert_rejected(store, self._payload({
+                    "op": "create", "track": "A", "state": "~",
+                    "statement": "行动正文", "basis": f"{newline}— 断点: 待定",
+                }, topic_id=topic_id))
+                self._assert_no_topic(store, topic_id)
+
+
+class TestPayloadWhitelist(TopicDockTestCase):
+    """M4/P5：save 载荷按 op 精确白名单（_save_locked 入口、分支树之前、全路径生效）
+    + state-on-create 文档化（A 轨 x/~/space、默认 space；非 A 轨 create/update 拒绝）。
+    """
+
+    def _advance(self, first, mutations):
+        return {
+            "topic_id": "alpha", "base_hop": first["head_hop"],
+            "base_sha": first["base_sha"], "session_id": "ses-02",
+            "summary": "推进", "mutations": mutations,
+        }
+
+    # ---- state-on-create 三例（A 轨 x / ~ / 默认 space） ----
+
+    def test_state_on_create_x_tilde_and_default_space(self):
+        store = make_store()
+        code, data = run_save(store, {
+            "topic_id": "alpha", "title": "t", "base_hop": None, "base_sha": None,
+            "session_id": "s", "actor": "t", "summary": "首轮",
+            "mutations": [
+                {"op": "create", "track": "A", "state": "x", "statement": "已完成行动"},
+                {"op": "create", "track": "A", "state": "~", "statement": "断点行动"},
+                {"op": "create", "track": "A", "statement": "默认行动"},
+            ]}, self.tmp_root)
+        self.assertEqual(code, 0)
+        md = (Path(store) / "topics" / "alpha.md").read_text(encoding="utf-8")
+        self.assertIn("- [x] [alpha:A1] 已完成行动 (H001)", md)
+        self.assertIn("- [~] [alpha:A2] 断点行动 (H001)", md)
+        self.assertIn("- [ ] [alpha:A3] 默认行动 (H001)", md)
+
+    def test_state_on_create_non_a_track_rejected(self):
+        store = make_store()
+        code, data = run_save(store, {
+            "topic_id": "alpha", "title": "t", "base_hop": None, "base_sha": None,
+            "session_id": "s", "actor": "t", "summary": "首轮",
+            "mutations": [
+                {"op": "create", "track": "Q", "state": "x", "statement": "问题带状态"},
+            ]}, self.tmp_root)
+        self.assertEqual(code, 7)
+        self.assertEqual(data["status"], "INVALID_INPUT")
+        self.assertIn("state", data.get("error", ""))
+        self.assertFalse((Path(store) / "topics" / "alpha.md").exists())
+
+    # ---- 白名单拒绝（mutation 级 / 顶层级 / update 非 A 轨 state） ----
+
+    def test_mutation_level_unknown_key_rejected(self):
+        store = make_store()
+        code, first, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        code, data = run_save(store, self._advance(first, [
+            {"op": "create", "track": "C", "statement": "白名单外结论",
+             "priority": "high"},
+        ]), self.tmp_root)
+        self.assertEqual(code, 7)
+        self.assertEqual(data["status"], "INVALID_INPUT")
+        self.assertIn("priority", data.get("error", ""))
+        md = (Path(store) / "topics" / "alpha.md").read_text(encoding="utf-8")
+        self.assertNotIn("白名单外结论", md)  # 零落盘
+
+    def test_top_level_unknown_keys_all_listed(self):
+        store = make_store()
+        code, first, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        code, data = run_save(store, dict(
+            self._advance(first, []), zebra=1, alpha_key=2), self.tmp_root)
+        self.assertEqual(code, 7)
+        self.assertEqual(data["status"], "INVALID_INPUT")
+        error = data.get("error", "")
+        self.assertIn("zebra", error)
+        self.assertIn("alpha_key", error)  # 错误信息列出全部未知键名
+
+    def test_update_non_a_track_state_rejected(self):
+        store = make_store()
+        code, first, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        code, data = run_save(store, self._advance(first, [
+            {"op": "update", "item_id": "C1", "state": "x",
+             "statement": "结论更新"},
+        ]), self.tmp_root)
+        self.assertEqual(code, 7)
+        self.assertEqual(data["status"], "INVALID_INPUT")
+        self.assertIn("state", data.get("error", ""))
+        md = (Path(store) / "topics" / "alpha.md").read_text(encoding="utf-8")
+        self.assertNotIn("结论更新", md)
+
+    def test_retract_common_keys_rejected(self):
+        # retract 仅 op/item_id；公共键（statement 等）一律拒绝
+        store = make_store()
+        code, first, _ = _new_topic(store, self.tmp_root)
+        self.assertEqual(code, 0)
+        code, data = run_save(store, self._advance(first, [
+            {"op": "retract", "item_id": "Q1", "statement": "撤回说明"},
+        ]), self.tmp_root)
+        self.assertEqual(code, 7)
+        self.assertIn("statement", data.get("error", ""))
+
+    # ---- 入口钉死：新建主题 / force-merge / STALE_BASE 早退路径同样拒绝 ----
+
+    def test_unknown_key_via_new_topic_path_rejected(self):
+        store = make_store()
+        code, data = run_save(store, {
+            "topic_id": "fresh", "title": "t", "base_hop": None, "base_sha": None,
+            "session_id": "s", "mutations": [
+                {"op": "create", "track": "C", "statement": "新建结论", "bogus": 1},
+            ]}, self.tmp_root)
+        self.assertEqual(code, 7)
+        self.assertEqual(data["status"], "INVALID_INPUT")
+        self.assertIn("bogus", data.get("error", ""))
+        self.assertFalse((Path(store) / "topics" / "fresh.md").exists())
+
+    def test_unknown_key_via_force_merge_path_rejected(self):
+        store = make_store()
+        code, first, _ = _new_topic(store, self.tmp_root)
+        old_sha = first["base_sha"]
+        run_save(store, {
+            "topic_id": "alpha", "base_hop": "H001", "base_sha": old_sha,
+            "session_id": "ses-02", "summary": "另一窗口推进", "mutations": [
+                {"op": "create", "track": "C", "statement": "他窗结论"}]},
+            self.tmp_root)
+        code, data = run_save(store, {
+            "topic_id": "alpha", "base_hop": "H001", "base_sha": old_sha,
+            "session_id": "ses-A", "mutations": [
+                {"op": "create", "track": "C", "statement": "强制结论", "bogus": 1},
+            ]}, self.tmp_root, "--force-merge")
+        self.assertEqual(code, 7)
+        self.assertEqual(data["status"], "INVALID_INPUT")
+        self.assertIn("bogus", data.get("error", ""))
+
+    def test_unknown_key_rejected_before_stale_early_exit(self):
+        """白名单校验先于 STALE_BASE 早退：失步载荷带未知键 → 7 而非 4。"""
+        store = make_store()
+        code, first, _ = _new_topic(store, self.tmp_root)
+        old_sha = first["base_sha"]
+        run_save(store, {
+            "topic_id": "alpha", "base_hop": "H001", "base_sha": old_sha,
+            "session_id": "ses-02", "summary": "另一窗口推进", "mutations": [
+                {"op": "create", "track": "C", "statement": "他窗结论"}]},
+            self.tmp_root)
+        code, data = run_save(store, {
+            "topic_id": "alpha", "base_hop": "H001", "base_sha": old_sha,
+            "session_id": "ses-A", "stale_probe": 1, "mutations": []},
+            self.tmp_root)
+        self.assertEqual(code, 7)
+        self.assertEqual(data["status"], "INVALID_INPUT")
+        self.assertIn("stale_probe", data.get("error", ""))
+
+
 class TestSimilarTopicsHint(TopicDockTestCase):
     """M2：base_hop=null 新建 save 附 similar_topics 非阻断提示（fail-open）。"""
 

@@ -17,17 +17,155 @@ EXIT_INVALID_INPUT = 7
 PLACEHOLDER_COMMANDS = ()  # 11 子命令全部实装（M7 收口）
 
 
+# 人类模式输出折叠：超过 TRIGGER 字节的物理行按码点边界硬折叠，续行带 MARKER；
+# 折叠后任一物理行 UTF-8 字节长度 <= 1500（TRIGGER 1200 + 标记字节数 << 1500）。
+_FOLD_TRIGGER_BYTES = 1200
+_FOLD_MARKER = "↪ "  # cli-contract §3 钉死的续接标记字面量（无 md 协议字面量冲突）
+
+_MATCH_META_ORDER = ("topic_id", "title", "score", "head_hop", "full", "updated_at")
+_MATCH_TAIL_ORDER = ("base_sha", "artifacts", "text")
+
+
+_STRUCTURE = False  # 结构行：按层级缩进
+_VERBATIM = True    # verbatim 内容行：原样落在第 0 列，不再被上层缩进改写
+
+
+def _scalar_text(value) -> str:
+    """人类模式标量：None/bool 走 JSON 字面量（null/true/false），其余 str()。"""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _render_field(name: str, value, depth: int, lines: list) -> None:
+    """单字段渲染：dict 逐键、list 逐元素、嵌套字符串逐行 verbatim（不进 json 转义）。"""
+    pad = "  " * depth
+    if isinstance(value, dict):
+        if not value:
+            lines.append((_STRUCTURE, f"{pad}{name}: {{}}"))
+            return
+        lines.append((_STRUCTURE, f"{pad}{name}:"))
+        _render_mapping(value, depth + 1, lines)
+    elif isinstance(value, list):
+        if not value:
+            lines.append((_STRUCTURE, f"{pad}{name}: []"))
+            return
+        lines.append((_STRUCTURE, f"{pad}{name}:"))
+        _render_sequence(value, depth + 1, lines)
+    elif isinstance(value, str) and "\n" in value:
+        lines.append((_STRUCTURE, f"{pad}{name}:"))
+        lines.extend((_VERBATIM, raw) for raw in value.splitlines())
+    else:
+        lines.append((_STRUCTURE, f"{pad}{name}: {_scalar_text(value)}"))
+
+
+def _render_mapping(mapping: dict, depth: int, lines: list) -> None:
+    for name, value in mapping.items():
+        _render_field(str(name), value, depth, lines)
+
+
+def _render_sequence(items: list, depth: int, lines: list) -> None:
+    pad = "  " * depth
+    for item in items:
+        if isinstance(item, dict) and item:
+            nested: list = []
+            _render_mapping(item, 0, nested)
+            _is_verbatim, first_text = nested[0]
+            lines.append((_STRUCTURE, f"{pad}- {first_text}"))
+            continuation_pad = pad + "  "
+            for is_verbatim, text in nested[1:]:
+                if is_verbatim:  # verbatim 内容行保持第 0 列
+                    lines.append((_VERBATIM, text))
+                else:
+                    lines.append((_STRUCTURE, continuation_pad + text))
+        elif isinstance(item, list):
+            if not item:
+                lines.append((_STRUCTURE, f"{pad}- []"))
+            else:
+                lines.append((_STRUCTURE, f"{pad}-"))
+                _render_sequence(item, depth + 1, lines)
+        elif isinstance(item, dict):
+            lines.append((_STRUCTURE, f"{pad}- {{}}"))
+        elif isinstance(item, str) and "\n" in item:
+            lines.append((_STRUCTURE, f"{pad}-"))
+            lines.extend((_VERBATIM, raw) for raw in item.splitlines())
+        else:
+            lines.append((_STRUCTURE, f"{pad}- {_scalar_text(item)}"))
+
+
+def _render_match_entry(entry: dict, index: int, lines: list) -> None:
+    """match 单命中分块：分隔行 + 元数据 + 全量 base_sha + artifacts + text + 结束行。"""
+    topic_id = entry.get("topic_id", "")
+    lines.append((_STRUCTURE, f"──── match {index}: {topic_id} ────"))
+    for name in _MATCH_META_ORDER:
+        if name in entry:
+            _render_field(name, entry[name], 1, lines)
+    for name in _MATCH_TAIL_ORDER:
+        if name in entry:
+            _render_field(name, entry[name], 1, lines)
+    handled = set(_MATCH_META_ORDER) | set(_MATCH_TAIL_ORDER)
+    for name, value in entry.items():
+        if name not in handled:  # 例如 --trace 附带的 traces
+            _render_field(str(name), value, 1, lines)
+    lines.append((_STRUCTURE, f"──── end match {index} ────"))
+
+
+def _byte_prefix_len(text: str, max_bytes: int) -> int:
+    """最长码点前缀的字符数，使其 UTF-8 编码不超过 max_bytes（绝不切开多字节码点）。"""
+    total = 0
+    for count, char in enumerate(text):
+        size = len(char.encode("utf-8"))
+        if total + size > max_bytes:
+            return count if count > 0 else 1
+        total += size
+    return len(text)
+
+
+def _fold_line(line: str) -> list:
+    if len(line.encode("utf-8")) <= _FOLD_TRIGGER_BYTES:
+        return [line]
+    chunks: list = []
+    rest = line
+    while rest:
+        cut = _byte_prefix_len(rest, _FOLD_TRIGGER_BYTES)
+        chunks.append(rest[:cut])
+        rest = rest[cut:]
+    folded = [chunks[0]]
+    folded.extend(_FOLD_MARKER + chunk for chunk in chunks[1:])
+    return folded
+
+
+def _fold_lines(lines: list) -> list:
+    folded: list = []
+    for line in lines:
+        folded.extend(_fold_line(line))
+    return folded
+
+
 def render_output(result: dict, as_json: bool) -> str:
-    """--json 时输出缩进 JSON；否则输出人类可读的键值行。"""
+    """--json 时输出缩进 JSON（改前后逐字节一致）；否则输出多行人类可读文本。
+
+    人类模式：dict 逐键行、list 逐元素行（非空嵌套 list 同样逐元素递归）、嵌套字符串
+    逐行 verbatim 且内容行恒在第 0 列；match 的 `results` 按命中分块呈现；最终拼接的
+    每个物理行超过 1200 字节即按码点边界折叠（续行以 `↪ ` 起头），硬保证任一物理行
+    UTF-8 字节长度 <= 1500。
+    """
     if as_json:
         return json.dumps(result, ensure_ascii=False, indent=2)
-    lines = []
+    rendered: list = []
     for key, value in result.items():
-        if isinstance(value, (dict, list)):
-            lines.append(f"{key}: {json.dumps(value, ensure_ascii=False, sort_keys=True)}")
+        if key == "results" and isinstance(value, list):
+            if not value:
+                rendered.append((_STRUCTURE, "results: []"))
+                continue
+            rendered.append((_STRUCTURE, "results:"))
+            for index, entry in enumerate(value, 1):
+                _render_match_entry(entry, index, rendered)
         else:
-            lines.append(f"{key}: {value}")
-    return "\n".join(lines)
+            _render_field(str(key), value, 0, rendered)
+    return "\n".join(_fold_lines([text for _is_verbatim, text in rendered]))
 
 
 def _make_placeholder_handler(command: str):

@@ -598,6 +598,133 @@ class TestItemEscaping(TopicDockTestCase):
         self.assertEqual(parse_topic_md(text).items["Q"][0].statement, "全角（15m）不转义")
 
 
+class TestSemanticMinimalEscaping(TopicDockTestCase):
+    """P4 修订：渲染端合成体级语义最小转义（仅当明文形态会 parse 错分时转义）。"""
+
+    def _line(self, text: str, marker: str) -> str:
+        return [line for line in text.split("\n") if marker in line][0]
+
+    def test_c_with_status_statement_pattern_zero_entity(self):
+        # 结构分隔符存在且 statement 内含完整模式 → rfind 命中真实边界 → 零实体
+        doc = _mk_doc()
+        poison = "前文 — 依据(verified): 伪依据 尾部"
+        doc.items["C"][0].statement = poison
+        original_basis = doc.items["C"][0].basis
+        text = render_topic_md(doc, TAGS)
+        self.assertNotIn("&#8212;", self._line(text, ":C2]"))
+        c2 = parse_topic_md(text).items["C"][0]
+        self.assertEqual(c2.statement, poison)
+        self.assertEqual(c2.evidence_status, "verified")
+        self.assertEqual(c2.basis, original_basis)
+
+    def test_q_with_basis_statement_pattern_minimal_escape(self):
+        # Q 轨 basis 不渲染 → 合成体无结构分隔符 → 全部模式出现处最小转义
+        doc = _mk_doc()
+        poison = "问题 — 原因: 伪原因 尾部"
+        doc.items["Q"][0].statement = poison
+        doc.items["Q"][0].basis = "Q 依据保留于状态但不渲染"
+        text = render_topic_md(doc, TAGS)
+        line = self._line(text, ":Q1]")
+        self.assertIn("&#8212;", line)
+        self.assertNotIn("Q 依据保留于状态但不渲染", line)
+        reparsed = parse_topic_md(text).items["Q"][0]
+        self.assertEqual(reparsed.statement, poison)
+        self.assertIsNone(reparsed.basis)
+
+    def test_c_without_status_basis_unrendered_minimal_escape(self):
+        # C-无-status：basis 保于状态但不渲染 → 合成体无结构分隔符 → 最小转义
+        doc = _mk_doc()
+        poison = "无状态结论 — 断点: 伪断点 尾部"
+        item = doc.items["C"][1]  # C3
+        item.evidence_status = None
+        item.basis = "保留于状态但不渲染的依据"
+        item.statement = poison
+        text = render_topic_md(doc, TAGS)
+        line = self._line(text, ":C3]")
+        self.assertIn("&#8212;", line)
+        self.assertNotIn("保留于状态但不渲染的依据", line)
+        reparsed = parse_topic_md(text).items["C"][1]
+        self.assertEqual(reparsed.statement, poison)
+        self.assertIsNone(reparsed.basis)
+
+    def test_no_basis_all_occurrences_escaped(self):
+        # 无-basis 形态：只转义最后一个会让更早的明文模式赢 rfind → 必须转义全部
+        doc = _mk_doc()
+        poison = "甲 — 原因: 乙 — 断点: 丙"
+        doc.items["Q"][0].statement = poison
+        text = render_topic_md(doc, TAGS)
+        line = self._line(text, ":Q1]")
+        self.assertEqual(line.count("&#8212;"), 2)
+        reparsed = parse_topic_md(text).items["Q"][0]
+        self.assertEqual(reparsed.statement, poison)
+        self.assertIsNone(reparsed.basis)
+
+    def test_boundary_basis_without_leading_space_parse_faithful(self):
+        # legacy 拼接边界：basis 以无前导空格的 `— 断点: ` 开头，借结构分隔符尾空格成假分隔符
+        doc = _mk_doc()
+        doc.items["A"][1].basis = "— 断点: 待敲定"  # A2
+        text = render_topic_md(doc, TAGS)
+        reparsed = parse_topic_md(text)
+        a2 = reparsed.items["A"][1]
+        self.assertEqual(a2.statement, doc.items["A"][1].statement)
+        self.assertEqual(a2.basis, "— 断点: 待敲定")
+        self.assertEqual(render_topic_md(reparsed, TAGS), text)
+
+    def test_literal_entity_text_not_over_escaped(self):
+        # 载荷字面量含 `&#8212;` 文本：判定不触发过转义，字节稳定
+        doc = _mk_doc()
+        doc.items["Q"][0].statement = "用户原文含 &#8212; 这个实体文本"
+        text = render_topic_md(doc, TAGS)
+        line = self._line(text, ":Q1]")
+        self.assertEqual(line.count("&#8212;"), 1)  # 仅用户字面量，不新增
+        self.assertEqual(render_topic_md(doc, TAGS), text)
+
+    def test_payload_roundtrip_zero_entity(self):
+        # 载荷含全角/破折号等字符：顶层行与 hop 分片字段逐字节同字符、零实体
+        store = make_store()
+        statement = "结论 —— ； （ ） 「」 · 保留原字符"
+        basis = "依据 —— ； （ ） 「」 · 同样保留"
+        code, data = run_save(store, {
+            "topic_id": "escape", "title": "转义往返", "base_hop": None,
+            "base_sha": None, "session_id": "s", "actor": "t", "summary": "首轮",
+            "mutations": [{"op": "create", "track": "C", "statement": statement,
+                           "evidence_status": "verified", "basis": basis}],
+        }, self.tmp_root)
+        self.assertEqual(code, 0)
+        md_text = (store / "topics" / "escape.md").read_text(encoding="utf-8")
+        self.assertIn(statement, md_text)
+        self.assertIn(basis, md_text)
+        self.assertNotIn("&#8212;", md_text)
+        self.assertNotIn("&#40;", md_text)
+        hop_text = (store / "hops" / topicdock.hop_file_name("H001")).read_text(
+            encoding="utf-8"
+        )
+        fields = parse_hop_md(hop_text).blocks[0].fields
+        self.assertEqual(fields["结论正文"], statement)
+        self.assertEqual(fields["一句话依据"], basis)
+
+    def test_legacy_entity_md_parses_back_to_plaintext(self):
+        # 手工构造的存量 md：读取还原把 `&#8212;` 转为明文 `—`
+        legacy = (
+            "---\n"
+            "schema_version: 1\n"
+            "topic_id: legacy\n"
+            'title: "legacy"\n'
+            "head_hop: H001\n"
+            "updated_at: 2026-11-01T00:00:00Z\n"
+            "last_actor: tester\n"
+            'next_seq: {"C":1,"R":0,"Q":0,"A":0}\n'
+            "---\n\n"
+            "## 1. 认知与定论 (Knowledge & Conclusions)\n\n"
+            "### 核心背景与已拍板结论 (Confirmed `[C]`)\n"
+            "- [legacy:C1] 旧文本 &#8212; 依据(verified): 伪 (H001)\n"
+        )
+        doc = parse_topic_md(legacy)
+        item = doc.items["C"][0]
+        self.assertEqual(item.statement, "旧文本 — 依据(verified): 伪")
+        self.assertIsNone(item.basis)
+
+
 def _mk_header(**over):
     header = {
         "v": 1, "hop_id": "H003", "topic_origin": "auth-refactor",

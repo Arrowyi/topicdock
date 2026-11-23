@@ -116,15 +116,49 @@ def _flatten_item_text(text: str) -> str:
     return str(text).replace("\n", " ").replace("\r", " ")
 
 
-def _escape_item_text(text: str) -> str:
-    """转义字面量分隔符与行尾 (…) 组，保证解析无歧义（design §4.2(1)）。"""
-    for sep in _ITEM_SEPARATORS:
-        if sep in text:
-            text = text.replace(sep, sep.replace("—", "&#8212;"))
+def _escape_trailing_tag_group(text: str) -> str:
+    """行尾 `(…)` 组转义为 `&#40;…)`，避免解析端误认作行尾短标（现行批准口径）。"""
     match = _TRAILING_TAG_RE.match(text)
     if match:
-        text = match.group(1) + " &#40;" + match.group(2) + ")"
+        return match.group(1) + " &#40;" + match.group(2) + ")"
     return text
+
+
+def _structural_separator(item: TopicItem) -> str | None:
+    """按渲染形态返回结构分隔符；Q 轨与 C-无-status 的 basis 不渲染 → None。"""
+    if not item.basis:
+        return None
+    if item.track == "C" and item.evidence_status:
+        return f" — 依据({item.evidence_status}): "
+    if item.track == "R":
+        return " — 原因: "
+    if item.track == "A":
+        return " — 断点: "
+    return None
+
+
+def _minimal_separator_escape(body: str, boundary: int | None) -> str:
+    """合成体级语义最小转义：仅转义会造成 parse 错分的完整分隔符模式出现处。
+
+    boundary = 结构分隔符起始索引（无结构分隔符 → None）。存在结构分隔符时只转义
+    起始索引大于 boundary 的模式：结构分隔符本体保留（rfind 命中真实边界），
+    statement 内更早的模式因 rfind 取最右边界而无害；无结构分隔符时转义全部出现处
+    （只转义最后一个会让更早的明文模式赢 rfind）。转义只作用于模式内 U+2014 本体；
+    判定与修复均为确定性纯函数，且只依赖合成体内分隔符位置（不经 unescape 判等）。
+    """
+    em_dash_positions: set[int] = set()
+    for sep in _ITEM_SEPARATORS:
+        start = body.find(sep)
+        while start != -1:
+            if boundary is None or start > boundary:
+                em_dash_positions.add(start + 1)
+            start = body.find(sep, start + 1)
+    if not em_dash_positions:
+        return body
+    return "".join(
+        "&#8212;" if index in em_dash_positions else char
+        for index, char in enumerate(body)
+    )
 
 
 def _unescape_item_text(text: str) -> str:
@@ -216,14 +250,15 @@ def format_trace_tag(
 # ---------- topics/<id>.md ----------
 
 def _render_item_line(doc: TopicDoc, item: TopicItem, tag: str | None) -> str:
-    # 压平为单行（design §4.2(1)）：statement/basis 内部换行替换为空格
-    body = _escape_item_text(_flatten_item_text(item.statement))
-    if item.track == "C" and item.evidence_status and item.basis:
-        body += f" — 依据({item.evidence_status}): {_escape_item_text(_flatten_item_text(item.basis))}"
-    elif item.track == "R" and item.basis:
-        body += f" — 原因: {_escape_item_text(_flatten_item_text(item.basis))}"
-    elif item.track == "A" and item.basis:
-        body += f" — 断点: {_escape_item_text(_flatten_item_text(item.basis))}"
+    # 压平为单行；行尾 `(…)` 组按现行口径转义（design §4.2(1)）
+    statement = _escape_trailing_tag_group(_flatten_item_text(item.statement))
+    sep = _structural_separator(item)
+    if sep is None:
+        # 合成体无结构分隔符（Q 轨 / C-无-status / 无 basis）→ 全部模式出现处最小转义
+        body = _minimal_separator_escape(statement, None)
+    else:
+        basis = _escape_trailing_tag_group(_flatten_item_text(item.basis))
+        body = _minimal_separator_escape(statement + sep + basis, len(statement))
     if tag:
         body += f" {tag}"
     prefix = f"[{doc.topic_id}:{item.item_id}]"

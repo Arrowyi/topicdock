@@ -67,7 +67,19 @@ next_seq: {"C":4,"R":2,"Q":2,"A":4}
 
 ### 1.3 Single-line separator disambiguation and escaping
 
-- If the body contains a literal ` — 依据(`, ` — 原因:`, ` — 断点:`, or a trailing parenthetical shaped like `(H001)`, rendering escapes the em dash as `&#8212;` and the left paren as `&#40;`; parsing matches the **last standard separator from the right** and restores the escapes, guaranteeing `parse(render(doc)) == doc`.
+Separator disambiguation is guaranteed by two layers:
+
+1. **Save-entry guard (write time).** `td save` rejects — through `_normalize_mutations`, covering the new-topic / amend / fork / force-merge payload paths — any mutation whose `statement` or `basis` embeds a complete separator pattern (` — 依据(verified): `, ` — 依据(inferred): `, ` — 原因: `, ` — 断点: `), or whose `basis` begins with a separator without a leading space (the structural separator's trailing space would complete a higher-position fake separator at the splice boundary). The result is `INVALID_INPUT` (exit code 7) with the item context in the message. Basis/reason/breakpoint text belongs in the `basis` field; the renderer adds the structural separator. Hop rich fields (`rationale` / `evidence_detail` / `review_cond`, multi-line shard format) are outside the guard.
+2. **Render-time synthesized-body semantic minimal escaping (read/replay time).** Rendering first synthesizes the plaintext item body for the item's render form (`statement` flattened + structural separator + `basis` flattened), then splits it with the same logic as `_split_item_body` and compares the recovered pair against the render pair **by raw separator positions** (never by comparing unescaped output). Only when the plaintext form would mis-split does it escape the em dash of the offending complete-pattern occurrences as `&#8212;`:
+   - Structural separator present and the rightmost separator sits exactly at the real structural boundary → zero escaping (patterns inside `statement` are harmless: `rfind` prefers the real boundary).
+   - Structural separator present but a pattern occurs beyond the boundary (inside `basis`, or a splice-boundary fake separator formed with the structural separator's trailing space) → escape those occurrences only.
+   - No structural separator (Q track, C without `evidence_status`, or empty `basis`) → escape **all** complete-pattern occurrences in the body (escaping only the last would let an earlier plaintext pattern win `rfind`).
+
+The four item render forms are: C-with-`evidence_status` renders `statement — 依据(<status>): basis`; R renders `statement — 原因: basis`; A renders `statement — 断点: basis`; **Q and C-without-`evidence_status` keep `basis` in the item state but do not render it**, so their synthesized body carries no structural separator. Because the decision depends only on separator positions in the synthesized body, `replay == md` always holds and rendering is a deterministic pure function; payload text containing a literal `&#8212;` does not trigger over-escaping.
+
+- **Trailing parenthetical group** (collision with `<auto_trace_tag>`): a trailing `(...)` group is still escaped as `&#40;...)` under the unchanged current rule. `&#40;` is not part of the semantic separator escaping and remains a legal on-disk entity.
+- **Semantic-required entity rows**: a row that would mis-split in its render form keeps its `&#8212;` deterministically until that item's text is updated (the subsequent update is guided by the save-entry guard into a legal shape). `doctor` restricts its `legacy_entity_cleanup` sweep to chain-replayable topics whose item rows still contain `&#8212;` and whose bytes differ from the new semantic render (see `references/cli-contract.md` §7).
+- **Degraded parse path** (`_state_from_md`, used when the head shard is missing): its parsed state is guaranteed by "rendering is always parse-faithful". The only exceptions are payloads whose literal text contains `&#8212;` / `&#40;`: the read-side restore turns them into `—` / `(` — pre-existing behavior, declared as-is.
 
 ---
 

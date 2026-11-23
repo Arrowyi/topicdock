@@ -907,6 +907,100 @@ def _repair_topic_mds(
     return reports, cascade_ids
 
 
+# ---------- ②b 存量过转义实体收敛（doctor 专属，不进入七步自愈序） ----------
+
+def _item_lines_contain_entity(text: str) -> bool:
+    """md 条目行是否含 `&#8212;` 字节（`&#40;` 不在扫描范围）。"""
+    for line in text.split("\n"):
+        if "&#8212;" not in line:
+            continue
+        if _A_LINE_RE.match(line) or _PLAIN_LINE_RE.match(line):
+            return True
+    return False
+
+
+def _next_seq_floor(*floors) -> dict[str, int]:
+    """逐轨取 max（md frontmatter 与 DB `next_seq_json` 的水位不变量）。"""
+    merged: dict[str, int] = {}
+    for floor in floors:
+        if not isinstance(floor, dict):
+            continue
+        for track, value in floor.items():
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                continue
+            merged[track] = max(merged.get(track, 0), value)
+    return merged
+
+
+def _md_frontmatter_next_seq(text: str) -> dict:
+    try:
+        return dict(parse_topic_md(text).next_seq)
+    except (ValueError, UnsupportedSchemaVersion):
+        return {}
+
+
+def legacy_entity_cleanup(store: StoreContext, conn: sqlite3.Connection) -> list[dict]:
+    """doctor 专属：收敛旧引擎逐字段过转义遗留的条目行（读命令路径零写）。
+
+    命中判据：条目行含 `&#8212;` 字节且当前 md 字节 ≠ 新语义渲染的链重放文本字节。
+    字节已相等（语义必需实体行或字面量实体内容）→ 零命中零报告，天然幂等；
+    链不可重放的主题静默跳过零报告（其 md 修复归 `_repair_topic_mds` 级联语义管辖）。
+    `next_seq` floor 取 md frontmatter 与 DB 的逐轨 max，且 DB `next_seq_json` 先行
+    提交后再覆写 md——避免 md 写完即崩溃时 DB 回滚致下次以低水位重放而编号回退。
+    """
+    reports: list[dict] = []
+    rows = conn.execute(
+        "SELECT topic_id, head_hop, next_seq_json FROM topics"
+    ).fetchall()
+    for row in rows:
+        topic_id, head = row["topic_id"], row["head_hop"]
+        md_path = store.topics_dir / f"{topic_id}.md"
+        if not md_path.is_file():
+            continue
+        try:
+            md_text = md_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if not _item_lines_contain_entity(md_text):
+            continue
+        chain = _walk_origin_chain(store, head, topic_id)[0]
+        if chain is None:
+            continue  # 链不可重放：静默跳过零报告
+        try:
+            rep = _replay_chain(topic_id, chain)
+        except ValueError:
+            continue
+        try:
+            db_floor = json.loads(row["next_seq_json"])
+        except ValueError:
+            db_floor = {}
+        floor = _next_seq_floor(_md_frontmatter_next_seq(md_text), db_floor)
+        text = _render_replayed_text(rep, chain[-1].sha, floor)
+        if text == md_text:
+            continue  # 语义必需实体行 / 字面量实体内容：字节已等于语义渲染
+        conn.execute(
+            "UPDATE topics SET next_seq_json=? WHERE topic_id=?",
+            (json.dumps(rep.doc.next_seq, ensure_ascii=False, sort_keys=True), topic_id),
+        )
+        conn.commit()  # DB 水位先落盘（先于 md 覆写，防崩溃窗口编号回退）
+        atomic_write_text(md_path, text)
+        conn.execute(
+            "UPDATE topics SET md_sha256=? WHERE topic_id=?",
+            (sha256_text(text), topic_id),
+        )
+        conn.commit()
+        reports.append(
+            {
+                "name": "legacy_entity_cleanup",
+                "status": "repaired",
+                "detail": f"{topic_id}（过转义实体收敛）",
+            }
+        )
+    return reports
+
+
 # ---------- ⑤ 引用中 hop 分类（D-P20 收紧 + D-P35 窗口） ----------
 
 def _amend_pending(store: StoreContext) -> dict | None:

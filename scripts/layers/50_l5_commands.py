@@ -168,6 +168,45 @@ def _make_allocator(conn, topic_id: str, doc) -> tuple[dict, callable]:
     return counters, allocate
 
 
+def _guard_item_separators(mutation: dict, op) -> None:
+    """存期守卫：statement/basis 不得内嵌完整条目分隔符（按渲染拼接语义域）。
+
+    判据同时覆盖三种形态：单独 statement、单独 basis、以及「结构分隔符 + basis」
+    拼接段——后者在分隔符本体位置之外仍出现完整分隔符模式时（basis 以无前导空格
+    的 `— 断点: ` 等开头，借结构分隔符尾空格形成高位假分隔符）即判歧义。依据/
+    原因/断点文本应放入 basis 字段，由渲染端生成结构分隔符；hop 富字段
+    （rationale/evidence_detail/review_cond 的分片多行格式）不在守卫范围。
+    """
+    statement = mutation.get("statement")
+    basis = mutation.get("basis")
+    context = str(op or "mutation")
+    item_id = mutation.get("item_id") or mutation.get("from_item")
+    if item_id:
+        context = f"{context} 条目 {item_id}"
+    elif mutation.get("track"):
+        context = f"{context}（{mutation.get('track')} 轨）"
+    hint = "请将依据/原因/断点文本放入 basis 字段，由渲染端生成结构分隔符"
+    # 判定副本先按渲染语义压平（\n / \r → 空格）；落盘数据本身不做任何改写
+    flat_statement = (
+        _flatten_item_text(str(statement)) if statement is not None else None
+    )
+    flat_basis = _flatten_item_text(str(basis)) if basis is not None else None
+    for field, text in (("statement", flat_statement), ("basis", flat_basis)):
+        if text is None:
+            continue
+        if any(sep in text for sep in _ITEM_SEPARATORS):
+            raise InvalidInput(
+                f"{context} 的 {field} 内嵌完整条目分隔符"
+                f"（形如「 — 依据(...): 」「 — 原因: 」「 — 断点: 」）；{hint}"
+            )
+    if flat_basis is not None and any(
+        (" " + flat_basis).startswith(sep) for sep in _ITEM_SEPARATORS
+    ):
+        raise InvalidInput(
+            f"{context} 的 basis 以无前导空格分隔符开头，与结构分隔符尾空格拼接歧义；{hint}"
+        )
+
+
 def _normalize_mutations(
     conn, topic_id: str, doc, rep, mutations: list, allocate
 ) -> list:
@@ -180,6 +219,7 @@ def _normalize_mutations(
         if not isinstance(mutation, dict):
             raise InvalidInput(f"mutation 必须是对象: {mutation!r}")
         op = mutation.get("op")
+        _guard_item_separators(mutation, op)  # 新建/amend/fork/force-merge 全载荷路径共用
         if op == "create":
             track = mutation.get("track")
             if track not in _TRACKS:
@@ -1103,7 +1143,78 @@ def _similar_topics_hint(conn, payload, topic_id):
         return None
 
 
+# ---------- save 载荷白名单（P5：校验钉在 _save_locked 入口，先于分支树） ----------
+
+_SAVE_TOP_KEYS = frozenset({
+    "topic_id", "title", "base_hop", "base_sha", "session_id", "actor",
+    "model", "summary", "next_focus", "parent_hops", "mutations", "artifacts",
+})
+_MUTATION_COMMON_KEYS = frozenset({
+    "op", "statement", "basis", "rationale", "evidence_detail",
+    "review_cond", "evidence_status",
+})
+_MUTATION_OP_KEYS = {
+    "create": _MUTATION_COMMON_KEYS | {"track", "state"},
+    "update": _MUTATION_COMMON_KEYS | {"item_id", "state"},
+    "overturn": _MUTATION_COMMON_KEYS | {"from_item"},
+    "resolve": _MUTATION_COMMON_KEYS | {"from_item", "into_track"},
+    "fold": _MUTATION_COMMON_KEYS | {"from_items"},
+    "retract": frozenset({"op", "item_id"}),
+}
+
+
+def _validate_state_track(index: int, mutation: dict) -> None:
+    """state 仅 A 轨 create/update 合法；非 A 轨携带 → INVALID_INPUT。
+
+    update 的轨道按 item_id 前缀判定（条目 id 首字符即轨道）；轨道未知
+    （create track 非法 / update item_id 畸形）时交由既有校验报错。
+    """
+    op = mutation.get("op")
+    if op == "create":
+        track = mutation.get("track")
+        if track != "A" and track in _TRACKS:
+            raise InvalidInput(
+                f"mutations[{index}]（op=create）state 仅 A 轨合法: track={track!r}"
+            )
+    elif op == "update":
+        item_id = str(mutation.get("item_id", ""))
+        if _ITEM_ID_RE.fullmatch(item_id) and _track_of(item_id) != "A":
+            raise InvalidInput(
+                f"mutations[{index}]（op=update）state 仅 A 轨合法: item_id={item_id}"
+            )
+
+
+def _validate_save_whitelist(payload: dict) -> None:
+    """save 载荷白名单校验：顶层键与 mutation 键按 op 精确收紧。
+
+    校验点钉在 _save_locked 入口、分支树（新建主题 / --fork-as /
+    --force-merge / STALE_BASE 早退）之前，保证全路径生效。未知键 →
+    INVALID_INPUT，错误信息列出全部未知键名；类型不符的载荷交由既有校验。
+    """
+    unknown = sorted(set(payload) - _SAVE_TOP_KEYS)
+    if unknown:
+        raise InvalidInput(f"载荷未知字段: {', '.join(unknown)}")
+    mutations = payload.get("mutations")
+    if not isinstance(mutations, list):
+        return
+    for index, mutation in enumerate(mutations):
+        if not isinstance(mutation, dict):
+            continue
+        op = mutation.get("op")
+        allowed = _MUTATION_OP_KEYS.get(op) if isinstance(op, str) else None
+        if allowed is None:
+            continue
+        unknown = sorted(set(mutation) - allowed)
+        if unknown:
+            raise InvalidInput(
+                f"mutations[{index}]（op={op}）未知字段: {', '.join(unknown)}"
+            )
+        if "state" in mutation:
+            _validate_state_track(index, mutation)
+
+
 def _save_locked(store, conn, payload, amend, fork_as, force_merge):
+    _validate_save_whitelist(payload)  # P5 白名单：先于全部分支树（含 STALE 早退）
     actor = _normalize_actor(payload.get("actor"))
     model = _normalize_model(payload.get("model"))
     topic_id = str(payload.get("topic_id", ""))
@@ -1948,6 +2059,8 @@ def _doctor_payload(store, conn_unused, args) -> dict:
         conn.commit()
         reports.append(_published_ledger_report(store))
         reports.append(_hop_oid_drift_report(store, conn))
+        # doctor 专属：存量过转义实体收敛（不进 ensure_store_healthy 七步序列）
+        reports.extend(legacy_entity_cleanup(store, conn))
     finally:
         conn.close()
     return {"status": "OK", "checks": reports}

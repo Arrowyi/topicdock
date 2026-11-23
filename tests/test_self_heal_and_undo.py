@@ -7,20 +7,24 @@ D-P35 amend-pending 记录。
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
+import uuid
 from pathlib import Path
 from unittest import mock
 
 from tests.util import (
     ALPHA_TITLE,
+    ChainBuilder,
     TopicDockTestCase,
     build_big_corpus,
     build_merged_store,
     build_rich_store,
     dump_tables,
     make_store,
+    run_cli,
     run_cli_json,
     run_save,
     write_hop,
@@ -74,6 +78,28 @@ def _delete_beta_rows(conn) -> None:
     conn.execute("DELETE FROM inverted_index WHERE topic_id='beta'")
     topicdock.refresh_ref_counts(conn, ["H002"])
     conn.commit()
+
+
+def _entity_topic(store, topic_id, blocks, title=None):
+    """构造单跳主题并写出新语义渲染 md（供 doctor 清理用例改写为存量形态）。"""
+    builder = ChainBuilder(store, topic_id, title or f"{topic_id} 主题标题")
+    builder.add_hop("H001", [], blocks, created_at="2026-11-01T00:00:00Z")
+    builder.write_md()
+    return builder
+
+
+def _register_legacy_md(store, builder, legacy_text) -> None:
+    """写入存量 md 并同步 DB `md_sha256`（自愈视为已登记，不经 md_repair 改写）。"""
+    builder.md_path().write_text(legacy_text, encoding="utf-8")
+    conn = get_or_create_db(_ctx(store))
+    try:
+        conn.execute(
+            "UPDATE topics SET md_sha256=? WHERE topic_id=?",
+            (topicdock.sha256_text(legacy_text), builder.topic_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 class TestHealRebuild(TopicDockTestCase):
@@ -344,6 +370,168 @@ class TestMdRepair(TopicDockTestCase):
             self.assertTrue(builders["alpha"].md_path().exists())
         finally:
             conn.close()
+
+
+class TestLegacyEntityCleanup(TopicDockTestCase):
+    """P4：doctor 专属存量过转义实体收敛（不进七步自愈序，读命令零写）。"""
+
+    OVER_ESCAPED_STATEMENT = "前文 — 依据(verified): 伪依据 尾部"
+
+    def _legacy_builder(self, store):
+        builder = _entity_topic(store, "legacy", [
+            topicdock.HopBlock(
+                item_id="C1", op="create", status="verified",
+                fields={"结论正文": self.OVER_ESCAPED_STATEMENT, "一句话依据": "真实依据"},
+            )
+        ])
+        conn, _ = ensure_store_healthy(_ctx(store))
+        conn.close()
+        semantic = builder.md_text()
+        # 新语义：statement 内模式保留（rfind 命中真实边界）→ 零实体
+        self.assertIn(self.OVER_ESCAPED_STATEMENT, semantic)
+        self.assertNotIn("&#8212;", semantic)
+        # 模拟旧引擎逐字段过转义：statement 内首个模式被转义
+        legacy = semantic.replace(
+            self.OVER_ESCAPED_STATEMENT,
+            self.OVER_ESCAPED_STATEMENT.replace("—", "&#8212;", 1),
+            1,
+        )
+        self.assertIn("&#8212;", legacy)
+        self.assertNotEqual(legacy, semantic)
+        _register_legacy_md(store, builder, legacy)
+        return builder, semantic, legacy
+
+    def test_over_escaped_md_repaired_and_idempotent(self):
+        store = make_store()
+        builder, semantic, legacy = self._legacy_builder(store)
+        self.assertEqual(builder.md_path().read_text(encoding="utf-8"), legacy)
+        code, report = run_cli_json(["doctor", "--store-dir", str(store), "--json"])
+        self.assertEqual(code, 0)
+        cleanup = [c for c in report["checks"] if c["name"] == "legacy_entity_cleanup"]
+        self.assertEqual(len(cleanup), 1)
+        self.assertEqual(cleanup[0]["status"], "repaired")
+        self.assertIn("legacy", cleanup[0]["detail"])
+        self.assertEqual(builder.md_path().read_text(encoding="utf-8"), semantic)
+        conn = get_or_create_db(_ctx(store))
+        try:
+            row = conn.execute(
+                "SELECT md_sha256 FROM topics WHERE topic_id='legacy'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["md_sha256"], topicdock.sha256_text(semantic))
+        # 天然幂等：第二次 doctor 零新增报告
+        code, report2 = run_cli_json(["doctor", "--store-dir", str(store), "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [c for c in report2["checks"] if c["name"] == "legacy_entity_cleanup"], []
+        )
+        self.assertEqual(builder.md_path().read_text(encoding="utf-8"), semantic)
+
+    def test_semantic_required_entity_zero_rewrite(self):
+        # 无-basis 条目 statement 含模式 → 语义必需实体行，字节已等于新语义渲染
+        store = make_store()
+        builder = _entity_topic(store, "semantic", [
+            topicdock.HopBlock(item_id="Q1", op="create",
+                fields={"结论正文": "提问 — 原因: 疑点"}),
+        ])
+        conn, _ = ensure_store_healthy(_ctx(store))
+        conn.close()
+        semantic = builder.md_text()
+        self.assertIn("&#8212;", semantic)
+        _register_legacy_md(store, builder, semantic)
+        code, report = run_cli_json(["doctor", "--store-dir", str(store), "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [c for c in report["checks"] if c["name"] == "legacy_entity_cleanup"], []
+        )
+        self.assertEqual(builder.md_path().read_text(encoding="utf-8"), semantic)
+
+    def test_literal_entity_content_zero_rewrite(self):
+        store = make_store()
+        builder = _entity_topic(store, "literal", [
+            topicdock.HopBlock(item_id="Q1", op="create",
+                fields={"结论正文": "用户原文含 &#8212; 字面量"}),
+        ])
+        conn, _ = ensure_store_healthy(_ctx(store))
+        conn.close()
+        semantic = builder.md_text()
+        self.assertIn("&#8212;", semantic)
+        _register_legacy_md(store, builder, semantic)
+        code, report = run_cli_json(["doctor", "--store-dir", str(store), "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [c for c in report["checks"] if c["name"] == "legacy_entity_cleanup"], []
+        )
+        self.assertEqual(builder.md_path().read_text(encoding="utf-8"), semantic)
+
+    def test_md_watermark_higher_than_db_preserved(self):
+        store = make_store()
+        builder, _semantic, legacy = self._legacy_builder(store)
+        self.assertIn('next_seq: {"C": 1}', legacy)
+        conn = get_or_create_db(_ctx(store))
+        try:
+            conn.execute(
+                "UPDATE topics SET next_seq_json=? WHERE topic_id='legacy'",
+                ('{"C": 1}',),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        bumped = legacy.replace('next_seq: {"C": 1}', 'next_seq: {"C": 9}')
+        self.assertNotEqual(bumped, legacy)
+        _register_legacy_md(store, builder, bumped)
+        code, report = run_cli_json(["doctor", "--store-dir", str(store), "--json"])
+        self.assertEqual(code, 0)
+        cleanup = [c for c in report["checks"] if c["name"] == "legacy_entity_cleanup"]
+        self.assertEqual(len(cleanup), 1)
+        md_text = builder.md_path().read_text(encoding="utf-8")
+        self.assertEqual(topicdock.parse_topic_md(md_text).next_seq["C"], 9)
+        conn = get_or_create_db(_ctx(store))
+        try:
+            row = conn.execute(
+                "SELECT next_seq_json FROM topics WHERE topic_id='legacy'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(json.loads(row["next_seq_json"])["C"], 9)
+
+    def test_unreplayable_chain_silently_skipped(self):
+        store = make_store()
+        builder, _semantic, legacy = self._legacy_builder(store)
+        (Path(store) / "hops" / "hop-001.md").unlink()  # own 链断裂
+        code, report = run_cli_json(["doctor", "--store-dir", str(store), "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [c for c in report["checks"] if c["name"] == "legacy_entity_cleanup"], []
+        )
+        self.assertEqual(builder.md_path().read_text(encoding="utf-8"), legacy)
+        conn = get_or_create_db(_ctx(store))
+        try:
+            self.assertIsNotNone(_head_row(conn, "legacy"))  # 断链不级联（md 完好）
+        finally:
+            conn.close()
+
+    def test_read_commands_zero_write_on_healthy_store(self):
+        store, _ = _rich_live_store()
+        topics_dir = Path(store) / "topics"
+        before_md = {p.name: p.read_bytes() for p in topics_dir.glob("*.md")}
+        conn = get_or_create_db(_ctx(store))
+        try:
+            before_db = dump_tables(conn)
+        finally:
+            conn.close()
+        for argv in (["use", "alpha"], ["match", "--recent"], ["list"]):
+            code, _ = run_cli_json([*argv, "--store-dir", str(store), "--json"])
+            self.assertEqual(code, 0)
+        after_md = {p.name: p.read_bytes() for p in topics_dir.glob("*.md")}
+        self.assertEqual(after_md, before_md)
+        conn = get_or_create_db(_ctx(store))
+        try:
+            after_db = dump_tables(conn)
+        finally:
+            conn.close()
+        self.assertEqual(after_db, before_db)
 
 
 class TestHopClassification(TopicDockTestCase):
@@ -2082,3 +2270,362 @@ class TestMatchAndUseTrace(TopicDockTestCase):
         )
         self.assertEqual(code, 7)
         self.assertEqual(data["status"], "INVALID_INPUT")
+
+
+# ---------- M2：人类模式输出面全量多行化 + 超长行折叠 ----------
+
+FOLD_MARKER = "↪ "            # cli-contract §3 钉死的折叠续接标记字面量
+FOLD_TRIGGER_BYTES = 1200     # 触发折叠的单行 UTF-8 字节阈值
+MAX_LINE_BYTES = 1500         # 人类模式任一物理行硬上限（字节）
+LONG_CJK_RUN = "长" * 1600    # 单条 md 行 >1500 字符（CJK）
+
+# M2 改前（tree 37116ac371b2950a105e76e518e907984719ff5e）引擎在固定时钟/固定
+# uuid 序列下跑同一 fixture 序列产出的 --json 规范化字节哈希（store/workspace/HOME
+# 绝对路径归一为 <STORE>/<WS>/<HOME>）。任一命令的 --json 载荷字段漂移都会使该
+# 命令哈希变化。生成方式见本节方法 docstring。
+GOLDEN_JSON_SHA256 = {
+    "init": "d1c4da2419297e3b626224bf038fd35440f4b21656cd6d939efbbe1d9a46d1f6",
+    "save_create": "22b3bb5a45c0495bf2fb66d9ff9d49a64ffc05ba64d4976b0bef5b825a5ceed8",
+    "save_create_second": "f9b8fcd24b71fa7f6fd0f78758a2ab791d185a6c56d4a262cbfc95834b583ec3",
+    "view": "174828cbf9fbaaa7f1bfb6972dc03d899c4f5a855666a62cd3de7855695eacb3",
+    "view_history": "5ad0035905da9b96617c1715e0ca7266cd7702b053b687cca8a80dd471f8feeb",
+    "list": "7338926f69789b994a2586cb7486d10823a204549d83f0ce574291b998dbb4d9",
+    "use": "8c961a89e0762dee28904dd1356a03aa4a146e0e842843247415909e28fe4495",
+    "match": "37ca278eac0f67de0bf901b6953ead23ff97e23aa24fd22ac054ac28aa40afdc",
+    "trace": "575a88977ed5a9777544386d551c458dfefffdeb46bbc77890c5adcb20c12d6f",
+    "delete": "2ad2f1e5f0ea50868241f800f7493930856b98992dcb0de281c2d019f2f122cc",
+    "merge": "9fffb215b29b7d5848d17eef6482935633c63b3bda2496eddbfd4f47d251b850",
+    "doctor": "717fb627de3dc9718c015a224a1af8e9f60acf4511592a92f8d83b24a976c8a3",
+    "undo": "2c24a7cfe91dc337862cca1710e762f030740c05b782fbb1fffdd78d253ed28b",
+}
+
+GOLDEN_A_PAYLOAD = {
+    "topic_id": "golden-a", "title": "Golden Alpha 主题",
+    "base_hop": None, "base_sha": None,
+    "session_id": "ses-golden", "actor": "golden-actor", "model": "golden-model",
+    "summary": "建立 golden 主题", "next_focus": "推进 golden",
+    "mutations": [
+        {"op": "create", "track": "C", "statement": "核心结论 golden",
+         "evidence_status": "verified", "basis": "golden 依据",
+         "rationale": "golden 权衡", "evidence_detail": "golden 证据",
+         "review_cond": "golden 重审"},
+        {"op": "create", "track": "Q", "statement": "未决问题 golden"},
+        {"op": "create", "track": "A", "state": "~", "statement": "断点行动 golden"},
+    ],
+    "artifacts": [{"name": "设计记录", "path": "/srv/golden/design.md", "note": "golden 注记"}],
+}
+
+GOLDEN_B_PAYLOAD = {
+    "topic_id": "golden-b", "title": "Golden Beta 主题",
+    "base_hop": None, "base_sha": None,
+    "session_id": "ses-golden", "actor": "golden-actor",
+    "mutations": [{"op": "create", "track": "C", "statement": "Beta 核心结论 golden"}],
+    "artifacts": [],
+}
+
+
+class TestHumanReadableRendering(TopicDockTestCase):
+    """M2：dict/list 不再压单行；match 分块；全部人类模式行 ≤1500 字节。"""
+
+    def _store_with_long_line(self):
+        """>=6 主题（含 full:false 路径）+ 一条 >1500 字符的 CJK md 行。"""
+        store = make_store()
+        build_big_corpus(store, n_topics=6, hops_per_topic=1)
+        long_topic = ChainBuilder(store, "longline", "长行主题")
+        long_topic.add_hop("H007", [], [
+            topicdock.HopBlock(
+                item_id="C1", op="create", status="verified",
+                fields={"结论正文": LONG_CJK_RUN + " LONGMARK", "一句话依据": "折叠边界证据"},
+            ),
+        ], created_at="2026-11-03T00:00:00Z")
+        long_topic.write_md()
+        return store
+
+    def _trace_store(self):
+        store = make_store()
+        code, saved = run_save(store, dict(TRACE_PAYLOAD), self.tmp_root)
+        self.assertEqual((code, saved["status"]), (0, "OK"))
+        return store
+
+    def _assert_line_budget(self, text):
+        for line in text.splitlines():
+            self.assertLessEqual(
+                len(line.encode("utf-8")), MAX_LINE_BYTES,
+                f"人类模式物理行超限: {line[:60]!r}",
+            )
+
+    def test_match_human_blocks_metadata_and_full_flag(self):
+        store = self._store_with_long_line()
+        code, data = run_cli_json(
+            ["match", "--topic", "核心结论", "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 0)
+        results = data["results"]
+        self.assertEqual(len(results), 6)
+        self.assertEqual([e["full"] for e in results[:5]], [True] * 5)
+        self.assertFalse(results[5]["full"])
+
+        code, out = run_cli(["match", "--topic", "核心结论", "--store-dir", str(store)])
+        self.assertEqual(code, 0)
+        self._assert_line_budget(out)
+        blocks = out.split("──── match ")[1:]
+        self.assertEqual(len(blocks), 6)
+        for index, (entry, block) in enumerate(zip(results, blocks), 1):
+            self.assertTrue(block.startswith(f"{index}: {entry['topic_id']} ────"), block[:40])
+            self.assertIn(f"──── end match {index} ────", block)
+            for key in ("topic_id", "title", "score", "full", "updated_at"):
+                self.assertIn(f"{key}:", block)
+            if entry["full"]:
+                self.assertRegex(block, r"base_sha: [0-9a-f]{64}")
+                self.assertIn("text:", block)
+            else:
+                self.assertNotIn("base_sha:", block)
+                self.assertNotIn("\ntext:", block)
+
+    def test_match_long_cjk_text_is_folded_losslessly(self):
+        store = self._store_with_long_line()
+        code, out = run_cli(["match", "--topic", "LONGMARK", "--store-dir", str(store)])
+        self.assertEqual(code, 0)
+        self._assert_line_budget(out)
+        self.assertIn(FOLD_MARKER, out)
+        rebuilt = "".join(
+            line[len(FOLD_MARKER):] if line.startswith(FOLD_MARKER) else line
+            for line in out.splitlines()
+        )
+        self.assertIn(LONG_CJK_RUN, rebuilt)
+
+    def test_use_and_view_mount_text_is_multiline(self):
+        store = self._store_with_long_line()
+        for argv in (["use", "longline", "--store-dir", str(store)],
+                     ["view", "longline", "--store-dir", str(store)]):
+            code, out = run_cli(argv)
+            self.assertEqual(code, 0, argv)
+            self._assert_line_budget(out)
+            self.assertIn("text:", out)
+            self.assertIn("## 1. 认知与定论", out)   # md 正文逐行 verbatim
+            self.assertNotIn("\\n", out)             # 无 json 转义
+            self.assertIn(FOLD_MARKER, out)          # 长行已折叠
+
+    def test_fold_never_splits_multibyte_codepoint_at_boundary(self):
+        # 前缀 "k: " = 3 字节；分别构造 emoji 起始字节偏移 1200 与 1198（跨边界）
+        for pad_len, expected_first_bytes in ((1197, 1200), (1195, 1198)):
+            value = "A" * pad_len + "😀" + "B" * 30
+            text = topicdock.render_output({"k": value}, False)
+            lines = text.split("\n")
+            self.assertGreater(len(lines), 1)
+            self.assertEqual(len(lines[0].encode("utf-8")), expected_first_bytes)
+            self.assertEqual(lines[0], "k: " + "A" * pad_len)
+            self.assertTrue(lines[1].startswith(FOLD_MARKER + "😀"), lines[1][:12])
+            for line in lines:
+                self.assertLessEqual(len(line.encode("utf-8")), MAX_LINE_BYTES)
+                line.encode("utf-8").decode("utf-8")  # 无截断残字节
+
+    def test_fold_marker_is_protocol_neutral(self):
+        for separator in topicdock._ITEM_SEPARATORS:
+            self.assertNotIn(separator, FOLD_MARKER)
+        self.assertNotIn("###", FOLD_MARKER)
+        self.assertNotIn("&#", FOLD_MARKER)
+
+        sample = FOLD_MARKER + "被折叠的续接文本"
+        statement, status, basis, _tag = topicdock._split_item_body(sample)
+        self.assertEqual(statement, sample)
+        self.assertIsNone(status)
+        self.assertIsNone(basis)
+
+        header = {
+            "v": 1, "hop_id": "H900", "topic_origin": "marker-topic", "title": "t",
+            "parents": [], "session_id": "s", "created_at": "2026-11-01T00:00:00Z",
+            "actor": "tester", "summary": "s", "next_focus": "", "artifacts": [],
+        }
+        hop = topicdock.HopDoc(header=header, blocks=[
+            topicdock.HopBlock(item_id="C1", op="create", status="verified",
+                               fields={"结论正文": "正文", "一句话依据": "依据"}),
+        ])
+        baseline_text = topicdock.render_hop_md(hop)
+        baseline = topicdock.parse_hop_md(baseline_text)
+        marker_text = baseline_text.replace(
+            "- 结论正文: 正文", "- 结论正文: 正文\n" + FOLD_MARKER + "续接块", 1
+        )
+        with_marker = topicdock.parse_hop_md(marker_text)
+        self.assertEqual(len(with_marker.blocks), len(baseline.blocks))
+        self.assertEqual(with_marker.blocks[0].fields, baseline.blocks[0].fields)
+
+    def test_use_trace_and_match_trace_render_multiline(self):
+        store = self._trace_store()
+        code, out = run_cli(
+            ["use", "trace-topic", "--trace", "auto", "--store-dir", str(store)]
+        )
+        self.assertEqual(code, 0)
+        self._assert_line_budget(out)
+        for needle in ("traces:", "Q1:", "blocks:", "### [Q1]"):
+            self.assertIn(needle, out)
+        self.assertNotIn('{"status"', out)
+
+        code, out = run_cli(
+            ["match", "--topic", "zzqtrace", "--trace", "auto", "--store-dir", str(store)]
+        )
+        self.assertEqual(code, 0)
+        self._assert_line_budget(out)
+        for needle in ("traces:", "Q1:", "blocks:", "### [Q1]"):
+            self.assertIn(needle, out)
+
+    def test_trace_blocks_render_multiline(self):
+        store = self._trace_store()
+        code, out = run_cli(["trace", "trace-topic", "C1", "--store-dir", str(store)])
+        self.assertEqual(code, 0)
+        self._assert_line_budget(out)
+        for needle in ("blocks:", "- hop_id: ", "text:", "### [C1]"):
+            self.assertIn(needle, out)
+        self.assertNotIn('"blocks"', out)
+
+    def test_list_view_history_doctor_render_multiline(self):
+        store = self._store_with_long_line()
+        code, out = run_cli(["list", "--store-dir", str(store)])
+        self.assertEqual(code, 0)
+        self._assert_line_budget(out)
+        self.assertIn("items:", out)
+        self.assertIn("- index: 1", out)
+
+        code, out = run_cli(["view", "longline", "--history", "--store-dir", str(store)])
+        self.assertEqual(code, 0)
+        self._assert_line_budget(out)
+        self.assertIn("history:", out)
+        self.assertIn("- hop_id: H007", out)
+
+        code, out = run_cli(["doctor", "--store-dir", str(store)])
+        self.assertEqual(code, 0)
+        self._assert_line_budget(out)
+        self.assertIn("checks:", out)
+        self.assertIn("- name: ", out)
+
+    def _assert_verbatim_column_zero(self, out, marker):
+        """verbatim 内容行必须严格始于第 0 列（带前导空白的出现同样算失败）。"""
+        lines = out.splitlines()
+        self.assertTrue(
+            any(line.startswith(marker) for line in lines),
+            f"{marker!r} 未出现在行首（第 0 列）",
+        )
+        for line in lines:
+            if marker in line:
+                self.assertTrue(
+                    line.startswith(marker), f"verbatim 内容行被缩进: {line[:48]!r}"
+                )
+
+    def test_trace_verbatim_content_starts_at_column_zero(self):
+        """F1：trace / use --trace / match --trace 的块正文严格第 0 列。"""
+        store = self._trace_store()
+        surfaces = (
+            (["trace", "trace-topic", "C1", "--store-dir", str(store)], "### [C1]"),
+            (["use", "trace-topic", "--trace", "auto", "--store-dir", str(store)], "### [Q1]"),
+            (["match", "--topic", "zzqtrace", "--trace", "auto", "--store-dir", str(store)],
+             "### [Q1]"),
+        )
+        for argv, marker in surfaces:
+            code, out = run_cli(argv)
+            self.assertEqual(code, 0, argv)
+            self._assert_verbatim_column_zero(out, marker)
+            self._assert_verbatim_column_zero(out, "- 结论正文:")
+
+    def test_nested_list_renders_element_per_line(self):
+        """F2：直接嵌套的非空 list 逐元素递归，不再 json.dumps 成单行。"""
+        text = topicdock.render_output({"x": [[1, 2], [], [3]]}, False)
+        self.assertEqual(text, "x:\n  -\n    - 1\n    - 2\n  - []\n  -\n    - 3")
+        self.assertNotIn("[1, 2]", text)
+
+    def test_all_eleven_commands_json_bytes_match_pre_m2_golden(self):
+        """F3：全 11 命令 --json 与改前逐字节一致（改前 golden 哈希回归）。
+
+        golden 生成：将 tree 37116ac371b2950a105e76e518e907984719ff5e 只读解包到
+        临时目录并 build，以固定 `_utc_now`（2026-11-01T00:00:00Z）与递增 uuid4
+        序列跑本 fixture 序列，将 store/workspace/HOME 绝对路径归一后取 sha256。
+        """
+        home = self.home_dir
+        workspace = self.workspace_dir
+        store = workspace / ".topicdock"
+        tmp = self.tmp_root / "golden-tmp"
+        tmp.mkdir()
+        counter = {"n": 0}
+
+        def fake_uuid4():
+            counter["n"] += 1
+            return uuid.UUID(int=counter["n"])
+
+        def normalize(text):
+            return (
+                text.replace(str(store), "<STORE>")
+                .replace(str(workspace), "<WS>")
+                .replace(str(home), "<HOME>")
+            )
+
+        def assert_golden(name, text):
+            self.assertEqual(
+                hashlib.sha256(normalize(text).encode("utf-8")).hexdigest(),
+                GOLDEN_JSON_SHA256[name],
+                f"{name} 的 --json 字节已偏离改前 golden",
+            )
+
+        def capture(argv):
+            code, out = run_cli(argv)
+            self.assertEqual(code, 0, (argv, out))
+            return out
+
+        def save_raw(payload):
+            payload_path = tmp / "save-payload.json"
+            payload_path.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            return capture(
+                ["save", "--json-file", str(payload_path),
+                 "--store-dir", str(store), "--json"]
+            )
+
+        with mock.patch.object(topicdock, "_utc_now", lambda: "2026-11-01T00:00:00Z"), \
+                mock.patch.object(topicdock.uuid, "uuid4", fake_uuid4):
+            assert_golden("init", capture(["init", "--scope", "local", "--json"]))
+            assert_golden("save_create", save_raw(GOLDEN_A_PAYLOAD))
+            assert_golden("save_create_second", save_raw(GOLDEN_B_PAYLOAD))
+            for name, argv in (
+                ("view", ["view", "golden-a", "--store-dir", str(store), "--json"]),
+                ("view_history",
+                 ["view", "golden-a", "--history", "--store-dir", str(store), "--json"]),
+                ("list", ["list", "--store-dir", str(store), "--json"]),
+                ("use", ["use", "golden-a", "--trace", "auto",
+                         "--store-dir", str(store), "--json"]),
+                ("match", ["match", "--topic", "golden", "--trace", "auto",
+                           "--store-dir", str(store), "--json"]),
+                ("trace", ["trace", "golden-a", "Q1", "--store-dir", str(store), "--json"]),
+                ("delete", ["delete", "1", "--store-dir", str(store), "--json"]),
+                ("merge", ["merge", "golden-b", "golden-a", "--summary", "并流 golden",
+                           "--store-dir", str(store), "--json"]),
+                ("doctor", ["doctor", "--store-dir", str(store), "--json"]),
+                ("undo", ["undo", "--store-dir", str(store), "--json"]),
+            ):
+                assert_golden(name, capture(argv))
+
+
+        store = self._store_with_long_line()
+        for argv in (["match", "--topic", "核心结论", "--store-dir", str(store)],
+                     ["use", "longline", "--store-dir", str(store)],
+                     ["view", "longline", "--store-dir", str(store)],
+                     ["list", "--store-dir", str(store)],
+                     ["doctor", "--store-dir", str(store)]):
+            code, out = run_cli(argv + ["--json"])
+            self.assertEqual(code, 0, argv)
+            self.assertEqual(
+                out,
+                json.dumps(json.loads(out), ensure_ascii=False, indent=2) + "\n",
+                f"--json 输出不再是规范化 JSON: {argv}",
+            )
+            self.assertNotIn(FOLD_MARKER, out)
+
+    def test_human_mode_field_set_matches_json_payload(self):
+        store = self._store_with_long_line()
+        for argv in (["use", "longline", "--store-dir", str(store)],
+                     ["view", "longline", "--store-dir", str(store)],
+                     ["match", "--topic", "核心结论", "--store-dir", str(store)]):
+            code, payload = run_cli_json(argv + ["--json"])
+            self.assertEqual(code, 0, argv)
+            code, out = run_cli(argv)
+            self.assertEqual(code, 0, argv)
+            for key in payload:
+                self.assertIn(f"{key}:", out, f"字段 {key} 未在人类模式出现: {argv}")
