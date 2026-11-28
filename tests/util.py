@@ -35,7 +35,18 @@ class TopicDockTestCase(unittest.TestCase):
         self.workspace_dir.mkdir()
         os.environ["HOME"] = str(self.home_dir)
         os.chdir(self.workspace_dir)
+        # 进程级 FTS5 标志隔离：降级/损坏用例会改这些标志，泄漏会造成
+        # 后续用例顺序相关的假绿或假红。
+        self._orig_fts5_available = topicdock._FTS5_AVAILABLE
+        self._orig_fts_needs_full_reindex = topicdock._FTS_NEEDS_FULL_REINDEX
+        topicdock._FTS5_AVAILABLE = None
+        topicdock._FTS_NEEDS_FULL_REINDEX = False
+        self.addCleanup(self._restore_fts_flags)
         self.addCleanup(self._restore_and_verify)
+
+    def _restore_fts_flags(self) -> None:
+        topicdock._FTS5_AVAILABLE = self._orig_fts5_available
+        topicdock._FTS_NEEDS_FULL_REINDEX = self._orig_fts_needs_full_reindex
 
     def _restore_and_verify(self) -> None:
         os.chdir(self._orig_cwd)
@@ -311,14 +322,26 @@ def build_big_corpus(store_root, n_topics=100, hops_per_topic=5):
 
 
 def dump_tables(conn, include_meta=True):
-    """QS-1 快照（D-P23 口径）：六表全量 + meta 的 schema_version/next_hop_seq。"""
+    """QS-1 快照（D-P23 口径）：数据表全量 + 索引逻辑表 + meta 关键水位。
+
+    `topic_fts` 投影为 8 个内容/标识列（不含 `md_sha256`）：undo 的 md 水位
+    棘轮会让 md_sha256 变化而索引正文不变，排除它才能做内容恒等断言。
+    """
     out = {}
-    for table in ("topics", "hops", "hop_edges", "item_hops", "item_links", "inverted_index"):
+    for table in ("topics", "hops", "hop_edges", "item_hops", "item_links"):
         out[table] = sorted(tuple(row) for row in conn.execute(f"SELECT * FROM {table}"))
+    out["topic_fts"] = sorted(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT topic_id, topic_slug, title, focus, c, q, a, r FROM topic_fts"
+            " ORDER BY topic_id"
+        )
+    )
     if include_meta:
         meta = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM meta")}
         out["meta"] = {
             "schema_version": meta.get("schema_version"),
             "next_hop_seq": meta.get("next_hop_seq"),
+            "match_index_schema": meta.get("match_index_schema"),
         }
     return out

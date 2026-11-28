@@ -26,6 +26,8 @@ TopicDock 把记忆的单位从客户端绑定的「会话」换成你自己拥�
 - **乐观并发校验（`STALE_BASE`）**：多个 Agent 窗口并发保存时，谁也不会静默覆盖谁。当一次保存的 `(base_hop, base_sha)` 已过期，`td save` 返回 `STALE_BASE`（退出码 4）：若你的改动与新内容没有重叠（`auto_absorbable: true`），换成 `current_head` 与 `current_sha` 重发即自动吸收；若存在冲突（`auto_absorbable: false`），由你选择分叉成新主题（`--fork-as <new_id>`），或在当前 head 之上重放（`--force-merge`）。
 - **启动自愈与 3 步防呆回滚（`td doctor` / `td undo`）**：除 `td init` 外的每条命令启动时都会检查账本完整性，能由 `topicdock.db` 与 `hops/` 重放还原的损坏会自动修复（也可用 `td doctor --rebuild` 强制 100% 冷重建）；无法修复或被改动了 `topic_id` 的文件会被清除，健康主题不会被拖累。`td undo` 回滚 3 步回滚栈（`save`、`amend`、`merge`、`delete`）中最近的一条，前提是没有更新的存活跳依赖它；条目编号与跳编号不会复用被撤回的编号。
 
+**`td match` 依赖 SQLite 编译期启用 FTS5。** FTS5 全文索引模块需编译进 Python 解释器链接的 SQLite 中。CPython 官方构建与 macOS / Linux 主流发行版构建默认包含 FTS5（本机 3.9.6 / SQLite 3.43.2 与 3.13 / SQLite 3.53.4 均实测启用）。缺少 FTS5 时，`td match` 报 `ERROR`（退出码 1）、`td doctor` 报 `match_index: unavailable`，其余命令不受影响。若回滚到旧版 TopicDock 引擎，请先运行 `td doctor --rebuild` —— 否则旧版 `td match` 对正文关键词会静默返回空结果，标题子串查询仍会命中。
+
 ## 三支柱工作流（Read / Trace / Write）
 
 Agent 遵循三条习惯，安装器会把它们作为简短的常驻守则注入。完整的工作流契约见 [`SKILL.md`](SKILL.md)。

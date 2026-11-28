@@ -413,7 +413,7 @@ class TestSimilarTopicsHint(TopicDockTestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(data["similar_topics"], [
-            {"topic_id": "alpha", "title": "auth jwt refactor plan", "score": 60},
+            {"topic_id": "alpha", "title": "auth jwt refactor plan", "score": 80},
         ])
 
     def test_unrelated_title_returns_empty_list(self):
@@ -460,13 +460,13 @@ class TestSimilarTopicsHint(TopicDockTestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("similar_topics", data)
 
-    def test_match_topics_failure_fails_open(self):
-        """⑤ match_topics 注入 RuntimeError → 退出码 0、字段完整、键缺省。"""
+    def test_similar_topics_failure_fails_open(self):
+        """⑤ similar_topics 注入 RuntimeError → 退出码 0、字段完整、键缺省。"""
         store = make_store()
         code, first, _ = _new_topic(store, self.tmp_root)
         self.assertEqual(code, 0)
         with mock.patch.object(
-            topicdock, "match_topics",
+            topicdock, "similar_topics",
             side_effect=RuntimeError("injected"),
         ):
             code, data, _ = _new_topic(
@@ -519,7 +519,7 @@ class TestSimilarTopicsHint(TopicDockTestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(data["similar_topics"], [
-            {"topic_id": "alpha", "title": "网关鉴权设计", "score": 54},
+            {"topic_id": "alpha", "title": "网关鉴权设计", "score": 71},
         ])
 
 

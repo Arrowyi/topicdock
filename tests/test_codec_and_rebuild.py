@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from unittest import mock
 
+from tests.fixtures.match_corpus import materialize_store
 from tests.util import (
     TopicDockTestCase,
     build_big_corpus,
@@ -1257,11 +1258,15 @@ class TestApplyHop(TopicDockTestCase):
 
 from topicdock import (  # noqa: E402
     allocate_hop_id,
+    delete_match_index,
     get_or_create_db,
+    match_recall,
     match_topics,
     next_hop_seq_value,
-    refresh_inverted_index,
+    refresh_match_index,
+    similar_topics,
     tokenize,
+    tokenize_terms,
 )
 
 
@@ -1344,7 +1349,7 @@ class TestMatchScoring(TopicDockTestCase):
             ("auth-jwt", doc1, "2026-11-10T00:00:00Z"),
             ("db-migration", doc2, "2026-11-12T00:00:00Z"),
         ):
-            refresh_inverted_index(conn, topic_id, doc)
+            refresh_match_index(conn, topic_id, doc, "sha-" + topic_id)
             conn.execute(
                 "INSERT INTO topics(topic_id, title, head_hop, updated_at, last_actor,"
                 " next_seq_json, md_sha256) VALUES(?,?,?,?,?,?,?)",
@@ -1353,80 +1358,71 @@ class TestMatchScoring(TopicDockTestCase):
         conn.commit()
         return conn
 
-    def test_full_phrase_title_hit_scores_75(self):
+    def test_full_phrase_title_hit_enters_all(self):
         conn = self._seed()
         results = match_topics(conn, ["认证模块"])
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["topic_id"], "auth-jwt")
-        self.assertEqual(results[0]["score"], 75)
+        self.assertEqual(results[0]["tier"], "all")
+        self.assertEqual(results[0]["matched_terms"], len(tokenize("认证模块")))
+        self.assertEqual(results[0]["score"], 100)  # 单条层内相对排名
 
-    def test_topic_id_substring_hit(self):
+    def test_topic_id_substring_hit_enters_all(self):
         conn = self._seed()
-        # "th-jw" 是 auth-jwt 的子串（非整词 token）→ 设计要求满分 3.0
         results = match_topics(conn, ["th-jw"])
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["topic_id"], "auth-jwt")
-        self.assertEqual(results[0]["score"], 75)
+        self.assertEqual([entry["topic_id"] for entry in results], ["auth-jwt"])
+        self.assertEqual(results[0]["tier"], "all")
+        self.assertEqual(results[0]["matched_terms"], 2)
 
-    def test_three_full_phrases_capped_at_100(self):
+    def test_multi_phrase_substring_does_not_hijack_other_phrase(self):
         conn = self._seed()
-        results = match_topics(conn, ["认证模块", "JWT 改造", "认证"])
-        # 三词组全部 title 子串命中 3.0 → (0.6+0.25+0.15)*3.0/2.4*100 = 125 → 封顶 100
-        self.assertEqual(results[0]["topic_id"], "auth-jwt")
-        self.assertEqual(results[0]["score"], 100)
+        # "认证模块" 子串命中标题，但 "数据库" 未命中 → 不得整体拉进 all 层
+        results = match_topics(conn, ["认证模块", "数据库"], tier="any")
+        entry = next(row for row in results if row["topic_id"] == "auth-jwt")
+        self.assertEqual(entry["tier"], "partial")
+        self.assertLess(entry["matched_terms"], len(tokenize("认证模块 ") | tokenize("数据库")))
 
-    def test_token_coverage_scoring(self):
+    def test_token_coverage_joins_all(self):
         conn = self._seed()
         results = match_topics(conn, ["网关统一验签"])
-        # tokens {网关,关统,统一,一验,验签} 全部命中 C 字段（权重 2.0）
-        # → 0.6*2.0/2.4*100 = 50
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["topic_id"], "auth-jwt")
-        self.assertEqual(results[0]["score"], 50)
+        self.assertEqual([entry["topic_id"] for entry in results], ["auth-jwt"])
+        self.assertEqual(results[0]["tier"], "all")
 
-    def test_partial_coverage_below_threshold(self):
-        conn = self._seed()
-        # tokens {网关,关验,验签} 仅 2/3 命中 → 0.6*(2/3*2.0)/2.4*100 ≈ 33 < 35
-        self.assertEqual(match_topics(conn, ["网关验签"]), [])
-
-    def test_below_threshold_not_recalled(self):
+    def test_unrelated_keywords_recall_nothing(self):
         conn = self._seed()
         self.assertEqual(match_topics(conn, ["完全不相关关键词"]), [])
 
-    def test_two_phrase_weighting(self):
+    def test_tier_is_cumulative_floor(self):
         conn = self._seed()
-        results = match_topics(conn, ["数据库灰度迁移", "验签"])
-        # db-migration: 词组1 title 全命中 3.0（最高词组），词组2 未命中
-        #   → 0.6*3.0/2.4*100 = 75
-        # auth-jwt: 词组2 命中 C(2.0) 为其最高词组，词组1 未命中
-        #   → 0.6*2.0/2.4*100 = 50
         self.assertEqual(
-            [(r["topic_id"], r["score"]) for r in results],
-            [("db-migration", 75), ("auth-jwt", 50)],
+            [entry["topic_id"] for entry in match_topics(conn, ["认证模块"], tier="all")],
+            ["auth-jwt"],
+        )
+        self.assertEqual(
+            [entry["topic_id"] for entry in match_topics(conn, ["认证模块"], tier="partial")],
+            ["auth-jwt"],
+        )
+        self.assertEqual(
+            [entry["topic_id"] for entry in match_topics(conn, ["认证模块"], tier="any")],
+            ["auth-jwt"],
         )
 
     def test_recent_bypass(self):
         conn = self._seed()
         results = match_topics(conn, [], recent=True)
         self.assertEqual(
-            [r["topic_id"] for r in results], ["db-migration", "auth-jwt"]
+            [entry["topic_id"] for entry in results], ["db-migration", "auth-jwt"]
         )
         self.assertIsNone(results[0]["score"])
+        self.assertNotIn("tier", results[0])
+        self.assertNotIn("matched_terms", results[0])
 
-    def test_tie_break_by_updated_at(self):
+    def test_match_recall_matched_sets(self):
         conn = self._seed()
-        doc3 = TopicDoc(topic_id="auth-jwt-2", title="认证模块 JWT 改造二", next_seq={})
-        refresh_inverted_index(conn, "auth-jwt-2", doc3)
-        conn.execute(
-            "INSERT INTO topics(topic_id, title, head_hop, updated_at, last_actor,"
-            " next_seq_json, md_sha256) VALUES(?,?,?,?,?,?,?)",
-            ("auth-jwt-2", doc3.title, "H002", "2026-11-11T00:00:00Z", "t", "{}", "x"),
-        )
-        conn.commit()
-        results = match_topics(conn, ["认证模块"])
-        self.assertEqual(len(results), 2)
-        self.assertEqual(results[0]["topic_id"], "auth-jwt-2")
-        self.assertEqual(results[1]["topic_id"], "auth-jwt")
+        recall = match_recall(conn, tokenize("网关统一验签"))
+        self.assertIn("auth-jwt", recall)
+        self.assertEqual(recall["auth-jwt"]["matched"], tokenize("网关统一验签"))
+        self.assertLess(recall["auth-jwt"]["bm25"], 0.0)
 
 
 class TestMainInitializedGate(TopicDockTestCase):
@@ -1523,10 +1519,12 @@ class TestQS1RebuildIdentity(TopicDockTestCase):
         build_rich_store(store)
         conn, _ = ensure_store_healthy(StoreContext(Path(store)))
         first = dump_tables(conn)
+        self._assert_match_index_matches_topics(conn)
         conn.close()
         rebuild_db_from_markdown(StoreContext(Path(store)))
         conn = get_or_create_db(StoreContext(Path(store)))
         second = dump_tables(conn)
+        self._assert_match_index_matches_topics(conn)
         conn.close()
         self.assertEqual(first, second)
 
@@ -1535,144 +1533,89 @@ class TestQS1RebuildIdentity(TopicDockTestCase):
         build_merged_store(store)
         conn, _ = ensure_store_healthy(StoreContext(Path(store)))
         first = dump_tables(conn)
+        self._assert_match_index_matches_topics(conn)
         conn.close()
         rebuild_db_from_markdown(StoreContext(Path(store)))
         conn = get_or_create_db(StoreContext(Path(store)))
         second = dump_tables(conn)
+        self._assert_match_index_matches_topics(conn)
         conn.close()
         self.assertEqual(first, second)
         # 已并流 src（gamma 无 md、无 topics 行）的派生行两路径一致（复审 #8）
         self.assertIn(("gamma", "C1", "H006", "create", 1), second["item_hops"])
         self.assertIn(("gamma", "Q1", "H006", "create", 1), second["item_hops"])
+        # 死 src 不得写入 topic_fts（幽灵行守卫）
+        fts_ids = [row[0] for row in second["topic_fts"]]
+        self.assertEqual(fts_ids, sorted(set(fts_ids)))
+        self.assertNotIn("gamma", fts_ids)
+
+    def _assert_match_index_matches_topics(self, conn):
+        """topic_fts.md_sha256 快照必须与 topics.md_sha256 逐主题恒等（design §5.3）。"""
+        indexed = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT topic_id, md_sha256 FROM topic_fts ORDER BY topic_id"
+            )
+        ]
+        topics = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT topic_id, md_sha256 FROM topics ORDER BY topic_id"
+            )
+        ]
+        self.assertEqual(indexed, topics)
 
     def test_perf_100_topics_500_hops(self):
+        """真实正文语料（40 主题、约 10~15KB/主题）冷重建 ≤ 500ms。"""
         store = make_store()
-        build_big_corpus(store)
+        materialize_store(store)
         started = time.perf_counter()
         rebuild_db_from_markdown(StoreContext(Path(store)))
         elapsed = time.perf_counter() - started
         conn = get_or_create_db(StoreContext(Path(store)))
         try:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0], 100)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM hops").fetchone()[0], 500)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0], 40
+            )
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM hops").fetchone()[0], 40)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM topic_fts").fetchone()[0], 40
+            )
         finally:
             conn.close()
         self.assertLessEqual(elapsed, 0.5, f"重建耗时 {elapsed:.3f}s 超出 500ms 预算")
+        print(f"[M2 perf] 真实正文 40 主题冷重建 {elapsed * 1000:.1f}ms")
 
 
 
-# ---------- M3/D9: match_topics 批量 SQL + 打分口径冻结字面量 ----------
+# ---------- M3/D9: 查询词元上限 ----------
 
 
 class TestMatchTopicsBatch(TopicDockTestCase):
-    """match_topics 批量聚合后打分口径与基线逐字面量一致（先冻结后断言）。"""
+    """MAX_QUERY_TOKENS 边界：L3 原语信任调用方，上限校验钉在 L5。"""
 
-    def _seed(self):
+    def test_max_query_tokens_constant(self):
+        self.assertEqual(topicdock.MAX_QUERY_TOKENS, 500)
+
+    def test_l5_rejects_over_limit(self):
         store = make_store()
-        ctx = StoreContext(store)
-        conn = get_or_create_db(ctx)
-        self.addCleanup(conn.close)
-        docs = (
-            ("auth-jwt", "认证模块 JWT 改造", "2026-11-10T00:00:00Z",
-             "网关统一验签 EdDSA", None, "吊销机制"),
-            ("db-migration", "数据库灰度迁移", "2026-11-12T00:00:00Z",
-             None, "双写窗口多长", "回滚预案"),
-            ("auth-jwt-2", "认证模块 JWT 改造二", "2026-11-11T00:00:00Z",
-             None, None, None),
+        build_rich_store(store)
+        code, data = run_cli_json(
+            ["match", "--store-dir", str(store), "--json",
+             "--topic", " ".join(f"z{index}" for index in range(501))]
         )
-        for topic_id, title, updated, c_stmt, q_stmt, focus in docs:
-            doc = TopicDoc(topic_id=topic_id, title=title, next_seq={})
-            if c_stmt:
-                doc.items["C"] = [
-                    TopicItem(item_id="C1", track="C", statement=c_stmt)
-                ]
-            if q_stmt:
-                doc.items["Q"] = [
-                    TopicItem(item_id="Q1", track="Q", statement=q_stmt)
-                ]
-            if focus:
-                doc.latest = LatestHop(hop_id="H001", next_focus=focus)
-            refresh_inverted_index(conn, topic_id, doc)
-            conn.execute(
-                "INSERT INTO topics(topic_id, title, head_hop, updated_at, last_actor,"
-                " next_seq_json, md_sha256) VALUES(?,?,?,?,?,?,?)",
-                (topic_id, title, "H001", updated, "tester", "{}", "x"),
-            )
-        conn.commit()
-        return conn
+        self.assertEqual(code, 7)
+        self.assertEqual(data["status"], "INVALID_INPUT")
+        self.assertIn("500", data.get("error", ""))
 
-    def _scores(self, conn, queries, threshold=35.0):
-        return [
-            (row["topic_id"], row["score"])
-            for row in match_topics(conn, queries, threshold=threshold)
-        ]
-
-    def test_frozen_scoring_literals(self):
-        conn = self._seed()
-        # 基线代码冻结（2026-11-20，M3 改动前）：中文二元组 / 多词组 / 同分 updated_at 倒序。
-        self.assertEqual(
-            self._scores(conn, ["认证模块"]),
-            [("auth-jwt-2", 75), ("auth-jwt", 75)],
+    def test_l5_rejects_empty_tokens(self):
+        store = make_store()
+        build_rich_store(store)
+        code, data = run_cli_json(
+            ["match", "--topic", "!!!", "--store-dir", str(store), "--json"]
         )
-        self.assertEqual(
-            self._scores(conn, ["th-jw"]),
-            [("auth-jwt-2", 75), ("auth-jwt", 75)],
-        )
-        self.assertEqual(
-            self._scores(conn, ["认证模块", "JWT 改造", "认证"]),
-            [("auth-jwt-2", 100), ("auth-jwt", 100)],
-        )
-        self.assertEqual(
-            self._scores(conn, ["网关统一验签"]), [("auth-jwt", 50)]
-        )
-        self.assertEqual(self._scores(conn, ["网关验签"]), [])
-        self.assertEqual(self._scores(conn, ["完全不相关关键词"]), [])
-        self.assertEqual(
-            self._scores(conn, ["数据库灰度迁移", "验签"]),
-            [("db-migration", 75), ("auth-jwt", 50)],
-        )
-        self.assertEqual(
-            self._scores(conn, ["JWT 改造"]),
-            [("auth-jwt-2", 75), ("auth-jwt", 75)],
-        )
-        self.assertEqual(
-            self._scores(conn, ["数据库灰度迁移"]), [("db-migration", 75)]
-        )
-        # focus 字段全词组命中：0.6*1.5/2.4*100 的浮点结果冻结为 37。
-        self.assertEqual(self._scores(conn, ["吊销机制"]), [("auth-jwt", 37)])
-
-    def test_frozen_threshold_boundary(self):
-        conn = self._seed()
-        # score == threshold 仍召回；threshold+1 即排除。
-        self.assertEqual(
-            self._scores(conn, ["网关统一验签"], threshold=50.0),
-            [("auth-jwt", 50)],
-        )
-        self.assertEqual(
-            self._scores(conn, ["网关统一验签"], threshold=51.0), []
-        )
-        self.assertEqual(
-            self._scores(conn, ["吊销机制"], threshold=37.0),
-            [("auth-jwt", 37)],
-        )
-
-    def test_batch_select_count_bounded(self):
-        conn = self._seed()
-        # 1100 个唯一 token → 3 个 500-token 块；SELECT 次数 ≤ 1 + 2*3。
-        queries = [" ".join(f"z{index}" for index in range(1100))]
-        statements: list[str] = []
-
-        def _trace(sql):
-            if sql.lstrip().upper().startswith("SELECT"):
-                statements.append(sql)
-
-        conn.set_trace_callback(_trace)
-        try:
-            match_topics(conn, queries)
-        finally:
-            conn.set_trace_callback(None)
-        self.assertGreaterEqual(len(statements), 2)  # topics 行 + 至少一个批次
-        self.assertLessEqual(len(statements), 1 + 2 * 3)
+        self.assertEqual(code, 7)
+        self.assertEqual(data["status"], "INVALID_INPUT")
 
 
 # ---------- M3/D9: _load_hop 单次读盘 / 换行归一 / _walk_origin_chain 跨步复用 ----------

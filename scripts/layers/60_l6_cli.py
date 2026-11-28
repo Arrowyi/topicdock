@@ -22,7 +22,7 @@ PLACEHOLDER_COMMANDS = ()  # 11 子命令全部实装（M7 收口）
 _FOLD_TRIGGER_BYTES = 1200
 _FOLD_MARKER = "↪ "  # cli-contract §3 钉死的续接标记字面量（无 md 协议字面量冲突）
 
-_MATCH_META_ORDER = ("topic_id", "title", "score", "head_hop", "full", "updated_at")
+_MATCH_META_ORDER = ("topic_id", "title", "tier", "matched_terms", "score", "head_hop", "full", "updated_at")
 _MATCH_TAIL_ORDER = ("base_sha", "artifacts", "text")
 
 
@@ -245,10 +245,13 @@ def _build_parser() -> argparse.ArgumentParser:
     view_parser.set_defaults(handler=cmd_view)
 
     match_parser = subparsers.add_parser(
-        "match", parents=[_global_option_parser()], help="recall topics by keywords (0-100 scoring)"
+        "match", parents=[_global_option_parser()], help="recall topics by keywords (tiered, bm25-ranked)"
     )
     match_parser.add_argument("--topic", action="append", help="query keyword (repeatable; may be omitted with --recent)")
-    match_parser.add_argument("--threshold", type=float, default=35.0, help="recall threshold (default 35)")
+    match_parser.add_argument(
+        "--tier", choices=("all", "partial", "any"), default=None,
+        help="cumulative recall floor: all (default) / partial (all+partial) / any (all three)",
+    )
     match_parser.add_argument("--recent", action="store_true", help="take the <=5 most recent topics directly (no --topic needed)")
     match_parser.add_argument(
         "--trace", default=None, metavar="<auto|items>",

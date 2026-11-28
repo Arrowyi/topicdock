@@ -1,0 +1,1005 @@
+{
+  "description": "旧实现（升级前 108135c）在 tests/fixtures/match_corpus.py 40 主题磁盘库上的 td match --json 输出。证据负对照，永不作断言预期；标签见 QUERIES。",
+  "generator": "td match --json (default --threshold 35)",
+  "query_count": 20,
+  "queries": [
+    {
+      "id": "Q01",
+      "topics": [
+        "设计"
+      ],
+      "results": [
+        {
+          "topic_id": "case-39-vesta",
+          "score": 50
+        },
+        {
+          "topic_id": "case-38-ceres",
+          "score": 50
+        },
+        {
+          "topic_id": "case-37-minerva",
+          "score": 50
+        },
+        {
+          "topic_id": "case-36-juno",
+          "score": 50
+        },
+        {
+          "topic_id": "case-35-iris",
+          "score": 50
+        },
+        {
+          "topic_id": "case-34-eros",
+          "score": 50
+        },
+        {
+          "topic_id": "case-33-selene",
+          "score": 50
+        },
+        {
+          "topic_id": "case-32-helios",
+          "score": 50
+        },
+        {
+          "topic_id": "case-31-artemis",
+          "score": 50
+        },
+        {
+          "topic_id": "case-30-apollo",
+          "score": 50
+        },
+        {
+          "topic_id": "case-29-hermes",
+          "score": 50
+        },
+        {
+          "topic_id": "case-28-atlas",
+          "score": 50
+        },
+        {
+          "topic_id": "case-27-nova",
+          "score": 50
+        },
+        {
+          "topic_id": "case-26-lyra",
+          "score": 50
+        },
+        {
+          "topic_id": "search-ranking-eval",
+          "score": 50
+        },
+        {
+          "topic_id": "case-09-kappa",
+          "score": 50
+        },
+        {
+          "topic_id": "case-08-iota",
+          "score": 50
+        },
+        {
+          "topic_id": "case-07-theta",
+          "score": 50
+        },
+        {
+          "topic_id": "case-06-eta",
+          "score": 50
+        },
+        {
+          "topic_id": "case-05-zeta",
+          "score": 50
+        },
+        {
+          "topic_id": "case-04-epsilon",
+          "score": 50
+        },
+        {
+          "topic_id": "case-03-delta",
+          "score": 50
+        },
+        {
+          "topic_id": "case-02-gamma",
+          "score": 50
+        },
+        {
+          "topic_id": "case-01-beta",
+          "score": 50
+        },
+        {
+          "topic_id": "case-00-alpha",
+          "score": 50
+        }
+      ],
+      "result_count": 25
+    },
+    {
+      "id": "Q02",
+      "topics": [
+        "设计",
+        "方案"
+      ],
+      "results": [
+        {
+          "topic_id": "search-ranking-eval",
+          "score": 96
+        },
+        {
+          "topic_id": "topicdock-match-rag",
+          "score": 75
+        },
+        {
+          "topic_id": "case-39-vesta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-37-minerva",
+          "score": 71
+        },
+        {
+          "topic_id": "case-36-juno",
+          "score": 71
+        },
+        {
+          "topic_id": "case-35-iris",
+          "score": 71
+        },
+        {
+          "topic_id": "case-34-eros",
+          "score": 71
+        },
+        {
+          "topic_id": "case-32-helios",
+          "score": 71
+        },
+        {
+          "topic_id": "case-31-artemis",
+          "score": 71
+        },
+        {
+          "topic_id": "case-30-apollo",
+          "score": 71
+        },
+        {
+          "topic_id": "case-29-hermes",
+          "score": 71
+        },
+        {
+          "topic_id": "case-28-atlas",
+          "score": 71
+        },
+        {
+          "topic_id": "case-27-nova",
+          "score": 71
+        },
+        {
+          "topic_id": "case-08-iota",
+          "score": 71
+        },
+        {
+          "topic_id": "case-07-theta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-06-eta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-05-zeta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-04-epsilon",
+          "score": 71
+        },
+        {
+          "topic_id": "case-03-delta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-01-beta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-00-alpha",
+          "score": 71
+        },
+        {
+          "topic_id": "case-38-ceres",
+          "score": 50
+        },
+        {
+          "topic_id": "case-33-selene",
+          "score": 50
+        },
+        {
+          "topic_id": "case-26-lyra",
+          "score": 50
+        },
+        {
+          "topic_id": "case-09-kappa",
+          "score": 50
+        },
+        {
+          "topic_id": "case-02-gamma",
+          "score": 50
+        }
+      ],
+      "result_count": 26
+    },
+    {
+      "id": "Q03",
+      "topics": [
+        "设计",
+        "方案",
+        "实现"
+      ],
+      "results": [
+        {
+          "topic_id": "search-ranking-eval",
+          "score": 96
+        },
+        {
+          "topic_id": "case-35-iris",
+          "score": 83
+        },
+        {
+          "topic_id": "case-34-eros",
+          "score": 83
+        },
+        {
+          "topic_id": "case-32-helios",
+          "score": 83
+        },
+        {
+          "topic_id": "case-31-artemis",
+          "score": 83
+        },
+        {
+          "topic_id": "case-30-apollo",
+          "score": 83
+        },
+        {
+          "topic_id": "case-29-hermes",
+          "score": 83
+        },
+        {
+          "topic_id": "case-08-iota",
+          "score": 83
+        },
+        {
+          "topic_id": "case-07-theta",
+          "score": 83
+        },
+        {
+          "topic_id": "case-06-eta",
+          "score": 83
+        },
+        {
+          "topic_id": "case-05-zeta",
+          "score": 83
+        },
+        {
+          "topic_id": "topicdock-match-rag",
+          "score": 75
+        },
+        {
+          "topic_id": "case-39-vesta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-37-minerva",
+          "score": 71
+        },
+        {
+          "topic_id": "case-36-juno",
+          "score": 71
+        },
+        {
+          "topic_id": "case-33-selene",
+          "score": 71
+        },
+        {
+          "topic_id": "case-28-atlas",
+          "score": 71
+        },
+        {
+          "topic_id": "case-27-nova",
+          "score": 71
+        },
+        {
+          "topic_id": "case-09-kappa",
+          "score": 71
+        },
+        {
+          "topic_id": "case-04-epsilon",
+          "score": 71
+        },
+        {
+          "topic_id": "case-03-delta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-01-beta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-00-alpha",
+          "score": 71
+        },
+        {
+          "topic_id": "case-38-ceres",
+          "score": 50
+        },
+        {
+          "topic_id": "case-26-lyra",
+          "score": 50
+        },
+        {
+          "topic_id": "case-02-gamma",
+          "score": 50
+        }
+      ],
+      "result_count": 26
+    },
+    {
+      "id": "Q04",
+      "topics": [
+        "设计",
+        "方案",
+        "穿透"
+      ],
+      "results": [
+        {
+          "topic_id": "search-ranking-eval",
+          "score": 96
+        },
+        {
+          "topic_id": "topicdock-match-rag",
+          "score": 75
+        },
+        {
+          "topic_id": "case-39-vesta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-37-minerva",
+          "score": 71
+        },
+        {
+          "topic_id": "case-36-juno",
+          "score": 71
+        },
+        {
+          "topic_id": "case-35-iris",
+          "score": 71
+        },
+        {
+          "topic_id": "case-34-eros",
+          "score": 71
+        },
+        {
+          "topic_id": "case-32-helios",
+          "score": 71
+        },
+        {
+          "topic_id": "case-31-artemis",
+          "score": 71
+        },
+        {
+          "topic_id": "case-30-apollo",
+          "score": 71
+        },
+        {
+          "topic_id": "case-29-hermes",
+          "score": 71
+        },
+        {
+          "topic_id": "case-28-atlas",
+          "score": 71
+        },
+        {
+          "topic_id": "case-27-nova",
+          "score": 71
+        },
+        {
+          "topic_id": "case-08-iota",
+          "score": 71
+        },
+        {
+          "topic_id": "case-07-theta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-06-eta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-05-zeta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-04-epsilon",
+          "score": 71
+        },
+        {
+          "topic_id": "case-03-delta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-01-beta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-00-alpha",
+          "score": 71
+        },
+        {
+          "topic_id": "case-38-ceres",
+          "score": 50
+        },
+        {
+          "topic_id": "case-33-selene",
+          "score": 50
+        },
+        {
+          "topic_id": "case-26-lyra",
+          "score": 50
+        },
+        {
+          "topic_id": "perf-dataplane-tuning",
+          "score": 50
+        },
+        {
+          "topic_id": "case-09-kappa",
+          "score": 50
+        },
+        {
+          "topic_id": "case-02-gamma",
+          "score": 50
+        }
+      ],
+      "result_count": 27
+    },
+    {
+      "id": "Q05",
+      "topics": [
+        "bm25"
+      ],
+      "results": [
+        {
+          "topic_id": "topicdock-match-rag",
+          "score": 50
+        }
+      ],
+      "result_count": 1
+    },
+    {
+      "id": "Q06",
+      "topics": [
+        "fts5"
+      ],
+      "results": [
+        {
+          "topic_id": "sqlite-fts5-index",
+          "score": 75
+        }
+      ],
+      "result_count": 1
+    },
+    {
+      "id": "Q07",
+      "topics": [
+        "缓存"
+      ],
+      "results": [
+        {
+          "topic_id": "long-title-cache-b",
+          "score": 75
+        },
+        {
+          "topic_id": "long-title-cache-a",
+          "score": 75
+        },
+        {
+          "topic_id": "case-39-vesta",
+          "score": 50
+        },
+        {
+          "topic_id": "case-38-ceres",
+          "score": 50
+        },
+        {
+          "topic_id": "case-35-iris",
+          "score": 50
+        },
+        {
+          "topic_id": "case-34-eros",
+          "score": 50
+        },
+        {
+          "topic_id": "case-33-selene",
+          "score": 50
+        },
+        {
+          "topic_id": "case-32-helios",
+          "score": 50
+        },
+        {
+          "topic_id": "case-31-artemis",
+          "score": 50
+        },
+        {
+          "topic_id": "case-30-apollo",
+          "score": 50
+        },
+        {
+          "topic_id": "case-29-hermes",
+          "score": 50
+        },
+        {
+          "topic_id": "case-28-atlas",
+          "score": 50
+        },
+        {
+          "topic_id": "case-27-nova",
+          "score": 50
+        },
+        {
+          "topic_id": "case-26-lyra",
+          "score": 50
+        },
+        {
+          "topic_id": "sqlite-fts5-index",
+          "score": 50
+        },
+        {
+          "topic_id": "perf-dataplane-tuning",
+          "score": 50
+        },
+        {
+          "topic_id": "case-09-kappa",
+          "score": 50
+        },
+        {
+          "topic_id": "case-08-iota",
+          "score": 50
+        },
+        {
+          "topic_id": "case-07-theta",
+          "score": 50
+        },
+        {
+          "topic_id": "case-06-eta",
+          "score": 50
+        },
+        {
+          "topic_id": "case-05-zeta",
+          "score": 50
+        },
+        {
+          "topic_id": "case-04-epsilon",
+          "score": 50
+        },
+        {
+          "topic_id": "case-03-delta",
+          "score": 50
+        },
+        {
+          "topic_id": "case-02-gamma",
+          "score": 50
+        }
+      ],
+      "result_count": 24
+    },
+    {
+      "id": "Q08",
+      "topics": [
+        "熔断"
+      ],
+      "results": [
+        {
+          "topic_id": "rate-limit-breaker",
+          "score": 75
+        }
+      ],
+      "result_count": 1
+    },
+    {
+      "id": "Q09",
+      "topics": [
+        "th-jw"
+      ],
+      "results": [
+        {
+          "topic_id": "auth-jwt",
+          "score": 75
+        }
+      ],
+      "result_count": 1
+    },
+    {
+      "id": "Q10",
+      "topics": [
+        "跨区域分布式缓存一致性协议在失效回退与流量切换场景下的工程实践性能权衡记录"
+      ],
+      "results": [
+        {
+          "topic_id": "long-title-cache-b",
+          "score": 75
+        },
+        {
+          "topic_id": "long-title-cache-a",
+          "score": 75
+        }
+      ],
+      "result_count": 2
+    },
+    {
+      "id": "Q11",
+      "topics": [
+        "topic 匹配",
+        "RAG",
+        "检索"
+      ],
+      "results": [
+        {
+          "topic_id": "topicdock-match-rag",
+          "score": 100
+        },
+        {
+          "topic_id": "search-ranking-eval",
+          "score": 75
+        },
+        {
+          "topic_id": "retrieval-evolution",
+          "score": 75
+        },
+        {
+          "topic_id": "rd-coder-pattern-and-review-convergence",
+          "score": 71
+        }
+      ],
+      "result_count": 4
+    },
+    {
+      "id": "Q12",
+      "topics": [
+        "分桶"
+      ],
+      "results": [
+        {
+          "topic_id": "release-canary-retro",
+          "score": 75
+        }
+      ],
+      "result_count": 1
+    },
+    {
+      "id": "Q13",
+      "topics": [
+        "幂等"
+      ],
+      "results": [
+        {
+          "topic_id": "retry-semantics",
+          "score": 50
+        }
+      ],
+      "result_count": 1
+    },
+    {
+      "id": "Q14",
+      "topics": [
+        "配额"
+      ],
+      "results": [
+        {
+          "topic_id": "capacity-governance",
+          "score": 45
+        }
+      ],
+      "result_count": 1
+    },
+    {
+      "id": "Q15",
+      "topics": [
+        "回滚"
+      ],
+      "results": [],
+      "result_count": 0
+    },
+    {
+      "id": "Q16",
+      "topics": [
+        "向量重排"
+      ],
+      "results": [
+        {
+          "topic_id": "retrieval-evolution",
+          "score": 37
+        }
+      ],
+      "result_count": 1
+    },
+    {
+      "id": "Q17",
+      "topics": [
+        "SQLite FTS5"
+      ],
+      "results": [
+        {
+          "topic_id": "sqlite-fts5-index",
+          "score": 75
+        }
+      ],
+      "result_count": 1
+    },
+    {
+      "id": "Q18",
+      "topics": [
+        "RAG 检索"
+      ],
+      "results": [
+        {
+          "topic_id": "topicdock-match-rag",
+          "score": 75
+        },
+        {
+          "topic_id": "search-ranking-eval",
+          "score": 37
+        },
+        {
+          "topic_id": "retrieval-evolution",
+          "score": 37
+        }
+      ],
+      "result_count": 3
+    },
+    {
+      "id": "Q19",
+      "topics": [
+        "缓存",
+        "优化"
+      ],
+      "results": [
+        {
+          "topic_id": "long-title-cache-b",
+          "score": 75
+        },
+        {
+          "topic_id": "long-title-cache-a",
+          "score": 75
+        },
+        {
+          "topic_id": "case-39-vesta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-38-ceres",
+          "score": 71
+        },
+        {
+          "topic_id": "case-35-iris",
+          "score": 71
+        },
+        {
+          "topic_id": "case-34-eros",
+          "score": 71
+        },
+        {
+          "topic_id": "case-30-apollo",
+          "score": 71
+        },
+        {
+          "topic_id": "case-29-hermes",
+          "score": 71
+        },
+        {
+          "topic_id": "case-28-atlas",
+          "score": 71
+        },
+        {
+          "topic_id": "case-27-nova",
+          "score": 71
+        },
+        {
+          "topic_id": "case-26-lyra",
+          "score": 71
+        },
+        {
+          "topic_id": "perf-dataplane-tuning",
+          "score": 71
+        },
+        {
+          "topic_id": "case-06-eta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-05-zeta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-04-epsilon",
+          "score": 71
+        },
+        {
+          "topic_id": "case-03-delta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-02-gamma",
+          "score": 71
+        },
+        {
+          "topic_id": "case-37-minerva",
+          "score": 50
+        },
+        {
+          "topic_id": "case-36-juno",
+          "score": 50
+        },
+        {
+          "topic_id": "case-33-selene",
+          "score": 50
+        },
+        {
+          "topic_id": "case-32-helios",
+          "score": 50
+        },
+        {
+          "topic_id": "case-31-artemis",
+          "score": 50
+        },
+        {
+          "topic_id": "sqlite-fts5-index",
+          "score": 50
+        },
+        {
+          "topic_id": "case-09-kappa",
+          "score": 50
+        },
+        {
+          "topic_id": "case-08-iota",
+          "score": 50
+        },
+        {
+          "topic_id": "case-07-theta",
+          "score": 50
+        },
+        {
+          "topic_id": "case-01-beta",
+          "score": 50
+        },
+        {
+          "topic_id": "case-00-alpha",
+          "score": 50
+        }
+      ],
+      "result_count": 28
+    },
+    {
+      "id": "Q20",
+      "topics": [
+        "设计",
+        "实现",
+        "验证"
+      ],
+      "results": [
+        {
+          "topic_id": "case-35-iris",
+          "score": 83
+        },
+        {
+          "topic_id": "case-32-helios",
+          "score": 83
+        },
+        {
+          "topic_id": "case-30-apollo",
+          "score": 83
+        },
+        {
+          "topic_id": "case-08-iota",
+          "score": 83
+        },
+        {
+          "topic_id": "case-06-eta",
+          "score": 83
+        },
+        {
+          "topic_id": "case-39-vesta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-37-minerva",
+          "score": 71
+        },
+        {
+          "topic_id": "case-34-eros",
+          "score": 71
+        },
+        {
+          "topic_id": "case-33-selene",
+          "score": 71
+        },
+        {
+          "topic_id": "case-31-artemis",
+          "score": 71
+        },
+        {
+          "topic_id": "case-29-hermes",
+          "score": 71
+        },
+        {
+          "topic_id": "case-28-atlas",
+          "score": 71
+        },
+        {
+          "topic_id": "case-27-nova",
+          "score": 71
+        },
+        {
+          "topic_id": "case-09-kappa",
+          "score": 71
+        },
+        {
+          "topic_id": "case-07-theta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-05-zeta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-04-epsilon",
+          "score": 71
+        },
+        {
+          "topic_id": "case-03-delta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-01-beta",
+          "score": 71
+        },
+        {
+          "topic_id": "case-38-ceres",
+          "score": 50
+        },
+        {
+          "topic_id": "case-36-juno",
+          "score": 50
+        },
+        {
+          "topic_id": "case-26-lyra",
+          "score": 50
+        },
+        {
+          "topic_id": "search-ranking-eval",
+          "score": 50
+        },
+        {
+          "topic_id": "auth-jwt",
+          "score": 50
+        },
+        {
+          "topic_id": "case-02-gamma",
+          "score": 50
+        },
+        {
+          "topic_id": "case-00-alpha",
+          "score": 50
+        }
+      ],
+      "result_count": 26
+    }
+  ],
+  "c1_false_positive": {
+    "topics": [
+      "topic 匹配",
+      "RAG",
+      "检索"
+    ],
+    "topic_id": "rd-coder-pattern-and-review-convergence",
+    "score": 71
+  }
+}

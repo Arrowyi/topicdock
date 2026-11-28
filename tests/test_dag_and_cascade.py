@@ -88,7 +88,7 @@ def _add_item_link(conn, topic_id, item_id, hop_id, link_type, src_topic, src_it
 
 
 def _dump(conn, tables=("topics", "hops", "hop_edges", "item_hops", "item_links",
-                        "inverted_index", "undo_stack")):
+                        "topic_fts", "undo_stack")):
     return {
         table: [dict(row) for row in conn.execute(f"SELECT * FROM {table}")]
         for table in tables
@@ -233,9 +233,8 @@ class TestApplyCascade(TopicDockTestCase):
         _add_edge(conn, "H001", "H002")
         _add_item_hops(conn, "a", "C1", [("H001", "create"), ("H002", "update")])
         _add_item_link(conn, "a", "R1", "H002", "overturn", "a", "C1", "H001")
-        conn.execute(
-            "INSERT INTO inverted_index(token, topic_id, field, weight)"
-            " VALUES('tok','a','C',2.0)"
+        topicdock.refresh_match_index(
+            conn, "a", topicdock.TopicDoc(topic_id="a", title="a"), "sha-a"
         )
         conn.commit()
         plan = plan_cascade(conn, ctx, ["a"])
@@ -245,7 +244,7 @@ class TestApplyCascade(TopicDockTestCase):
         self.assertEqual(_dump(conn, ("hop_edges",))["hop_edges"], [])
         self.assertEqual(_dump(conn, ("item_hops",))["item_hops"], [])
         self.assertEqual(_dump(conn, ("item_links",))["item_links"], [])
-        self.assertEqual(_dump(conn, ("inverted_index",))["inverted_index"], [])
+        self.assertEqual(_dump(conn, ("topic_fts",))["topic_fts"], [])
 
     def test_merged_src_rows_preserved_while_hops_live(self):
         store = make_store()
@@ -719,7 +718,7 @@ class TestMergeDeleteUndo(TopicDockTestCase):
         self.assertEqual(after["hop_edges"], before["hop_edges"])
         self.assertEqual(after["item_hops"], before["item_hops"])
         self.assertEqual(after["item_links"], before["item_links"])
-        self.assertEqual(after["inverted_index"], before["inverted_index"])
+        self.assertEqual(after["topic_fts"], before["topic_fts"])
         before_alpha = next(r for r in before["topics"] if r[0] == "alpha")
         after_alpha = next(r for r in after["topics"] if r[0] == "alpha")
         self.assertEqual(after_alpha[:6], before_alpha[:6])  # 同键同值至 last_actor

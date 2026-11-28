@@ -608,7 +608,7 @@ def _commit_new_hop(
             sha256_text(md_text),
         ),
     )
-    refresh_inverted_index(conn, topic_id, doc)
+    refresh_match_index(conn, topic_id, doc, sha256_text(md_text))
     refresh_ref_counts(conn, [hop_id] + ([old_head] if old_head else []))
     created_files = []
     if old_md_text is None:
@@ -1033,7 +1033,7 @@ def _save_amend(store, conn, payload, topic_id, row, chain, rep, counters_alloca
             sha256_text(md_text), topic_id,
         ),
     )
-    refresh_inverted_index(conn, topic_id, rep2.doc)
+    refresh_match_index(conn, topic_id, rep2.doc, sha256_text(md_text))
     push_undo(
         conn, "amend", str(payload.get("summary", "")),
         {
@@ -1130,14 +1130,13 @@ def _save_fork(store, conn, payload, topic_id, row, chain, rep, base_hop, fork_a
 
 
 def _similar_topics_hint(conn, payload, topic_id):
-    """新建主题时的 similar_topics 非阻断提示（fail-open：异常返回 None 省略键）。"""
+    """新建主题时的 similar_topics 覆盖率提示（fail-open：异常返回 None 省略键）。"""
     try:
         title = str(payload.get("title") or topic_id)  # 与 _save_new_topic 同口径
-        scored = match_topics(conn, [title])
         return [
-            {"topic_id": entry["topic_id"], "title": entry["title"], "score": entry["score"]}
-            for entry in scored[:3]
-            if entry["score"] >= 35 and entry["topic_id"] != topic_id
+            entry
+            for entry in similar_topics(conn, title)
+            if entry["topic_id"] != topic_id
         ]
     except Exception:
         return None
@@ -1659,7 +1658,7 @@ def _merge_payload(store, conn, args) -> dict:
     )
     # src 行删除（DB 同事务）；src 派生行保留（trace 递归依赖，复审 #8）
     conn.execute("DELETE FROM topics WHERE topic_id=?", (src_id,))
-    conn.execute("DELETE FROM inverted_index WHERE topic_id=?", (src_id,))
+    delete_match_index(conn, [src_id])
     refresh_ref_counts(conn, [hop_id, src_row["head_hop"]])
     return {
         "status": "OK", "topic_id": dst_id, "dst_topic_id": dst_id,
@@ -2048,8 +2047,31 @@ def _hop_oid_drift_report(store, conn) -> dict:
     }
 
 
+def _match_index_doctor_report(conn) -> dict:
+    """无参 doctor 固定附加的 match_index 巡检项；ok 时顺带 integrity-check。"""
+    if _FTS5_AVAILABLE is False:
+        return {
+            "name": "match_index",
+            "status": "unavailable",
+            "detail": "SQLite 未启用 FTS5；匹配索引不可用",
+        }
+    try:
+        count = match_index_health(conn)
+    except sqlite3.DatabaseError as exc:
+        return {
+            "name": "match_index",
+            "status": "mismatch",
+            "detail": f"完整性校验失败: {exc}",
+        }
+    return {
+        "name": "match_index",
+        "status": "ok",
+        "detail": f"{_MATCH_INDEX_SCHEMA}，{count} 行，integrity-check 通过",
+    }
+
+
 def _doctor_payload(store, conn_unused, args) -> dict:
-    """doctor [--rebuild]：无参 = 七步自愈巡检 + 封板台账/oid 漂移双巡检；
+    """doctor [--rebuild]：无参 = 七步自愈巡检 + 封板台账/oid 漂移/匹配索引巡检；
     --rebuild = 强制冷重建（保留既有封板台账）。"""
     if getattr(args, "rebuild", False):
         reports = rebuild_db_from_markdown(store)
@@ -2061,6 +2083,9 @@ def _doctor_payload(store, conn_unused, args) -> dict:
         reports.append(_hop_oid_drift_report(store, conn))
         # doctor 专属：存量过转义实体收敛（不进 ensure_store_healthy 七步序列）
         reports.extend(legacy_entity_cleanup(store, conn))
+        if not any(check.get("name") == "match_index" for check in reports):
+            reports.append(_match_index_doctor_report(conn))
+        conn.commit()
     finally:
         conn.close()
     return {"status": "OK", "checks": reports}
@@ -2498,7 +2523,7 @@ def cmd_view_locked(store, conn, args) -> dict:
 
 
 def cmd_match(args) -> tuple[dict, int]:
-    """`td match --topic <kw> [--topic <kw> ...] [--threshold 35] [--recent]`。"""
+    """`td match [--topic <kw> ...] [--tier all|partial|any] [--recent]`。"""
     store, early = _read_command_common(args)
     if early is not None:
         return early
@@ -2513,20 +2538,81 @@ def cmd_match(args) -> tuple[dict, int]:
     return result, EXIT_OK
 
 
+def _match_hint(recall: dict) -> str | None:
+    """非 --recent 匹配的完备四分支 hint（design §3.3）。"""
+    returned = recall["returned"]
+    any_term = recall["any_term"]
+    total = recall["total"]
+    if 1 <= returned <= 5 and any_term == returned:
+        return None  # 精准窄命中：无需引导
+    if returned == 0:
+        if any_term > 0:
+            return (
+                f"无全词命中；{recall['partial']} 个主题命中多数、"
+                f"{any_term} 个主题命中任一词元。可用 --tier partial|any 放宽或换词。"
+            )
+        return (
+            f"0/{total} 个主题命中查询词；请换更通用的关键词，"
+            "或用 td match --recent / td list 查看现有主题。"
+        )
+    if returned > 5:
+        hint = (
+            f"{returned}/{total} 个主题命中（前 5 条附完整正文）；"
+            "可再加一个 --topic 关键词缩小范围"
+        )
+        if any_term > returned:
+            hint += (
+                f"，或用 --tier partial|any 查看其余 {any_term - returned} 条部分命中"
+            )
+        return hint
+    # 1 <= returned <= 5 且 any_term > returned
+    return (
+        f"返回 {returned} 条当前层命中；另有 {any_term - returned} 个主题"
+        "只命中部分词元（可用 --tier partial|any 放宽）。"
+    )
+
+
 def cmd_match_locked(store, conn, args) -> dict:
     queries = getattr(args, "topic", None) or []
     recent = bool(getattr(args, "recent", False))
+    tier = getattr(args, "tier", None)
+    if recent and tier is not None:
+        raise InvalidInput("--recent 与 --tier 不能同时使用")
     if not queries and not recent:
         raise InvalidInput("match 至少需要一个 --topic 查询词，或使用 --recent")
-    threshold = getattr(args, "threshold", None)
-    threshold = 35.0 if threshold is None else float(threshold)
     trace_spec = getattr(args, "trace", None)
     if trace_spec is not None:
         _validate_trace_spec(trace_spec)
-    results = match_topics(
-        conn, [str(query) for query in queries], threshold=threshold,
-        recent=recent,
-    )
+    if recent:
+        results = match_topics(conn, [], recent=True)
+        recall = None
+        hint = None
+    else:
+        tokens = set()
+        for query in queries:
+            tokens |= tokenize(query)
+        if not tokens:
+            raise InvalidInput("查询词没有可索引的词元")
+        if len(tokens) > MAX_QUERY_TOKENS:
+            raise InvalidInput(
+                f"查询词元数 {len(tokens)} 超过上限 {MAX_QUERY_TOKENS}"
+            )
+        tier = tier or "all"
+        # 层内评分与 --tier 取值无关：先取三层全量，再按累计最低层过滤，
+        # 使 recall 汇总始终统计全部层。
+        combined = match_topics(conn, [str(query) for query in queries], tier="any")
+        selected = {"all": {"all"}, "partial": {"all", "partial"}, "any": {"all", "partial", "any"}}
+        allowed = selected[tier]
+        results = [entry for entry in combined if entry["tier"] in allowed]
+        total = conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0]
+        recall = {
+            "all_terms": sum(1 for entry in combined if entry["tier"] == "all"),
+            "partial": sum(1 for entry in combined if entry["tier"] == "partial"),
+            "any_term": len(combined),
+            "total": total,
+            "returned": len(results),
+        }
+        hint = _match_hint(recall)
     hop_cache: dict = {}
     for offset, entry in enumerate(results):
         if offset < 5:  # 前 ≤5 附完整挂载凭证（D-P16/D9 同口径）
@@ -2550,7 +2636,12 @@ def cmd_match_locked(store, conn, args) -> dict:
                 )
         else:
             entry["full"] = False
-    return {"status": "OK", "results": results}
+    payload = {"status": "OK", "results": results}
+    if recall is not None:
+        payload["recall"] = recall
+        if hint is not None:
+            payload["hint"] = hint
+    return payload
 
 
 def cmd_trace(args) -> tuple[dict, int]:

@@ -64,7 +64,7 @@ def _delete_gamma_rows(conn) -> None:
     conn.execute("DELETE FROM hops WHERE hop_id='H006'")
     conn.execute("DELETE FROM item_hops WHERE topic_id='gamma'")
     conn.execute("DELETE FROM item_links WHERE topic_id='gamma'")
-    conn.execute("DELETE FROM inverted_index WHERE topic_id='gamma'")
+    conn.execute("DELETE FROM topic_fts WHERE topic_id='gamma'")
     conn.commit()
 
 
@@ -75,7 +75,7 @@ def _delete_beta_rows(conn) -> None:
     conn.execute("DELETE FROM hop_edges WHERE child_hop='H005'")
     conn.execute("DELETE FROM item_hops WHERE topic_id='beta'")
     conn.execute("DELETE FROM item_links WHERE topic_id='beta'")
-    conn.execute("DELETE FROM inverted_index WHERE topic_id='beta'")
+    conn.execute("DELETE FROM topic_fts WHERE topic_id='beta'")
     topicdock.refresh_ref_counts(conn, ["H002"])
     conn.commit()
 
@@ -1065,19 +1065,27 @@ class TestListCommand(TopicDockTestCase):
 
 
 class TestMatchCommand(TopicDockTestCase):
-    def test_match_recall_full_text_cap_five(self):
+    def test_match_all_tier_full_text_cap_five(self):
         store = make_store()
         build_big_corpus(store, n_topics=12, hops_per_topic=1)
         code, data = run_cli_json(
             ["match", "--topic", "核心结论", "--store-dir", str(store), "--json"]
         )
         self.assertEqual(code, 0)
-        self.assertEqual(len(data["results"]), 12)  # 12 个同构主题全部 ≥35 召回
-        self.assertEqual({r["score"] for r in data["results"]}, {50})
+        self.assertEqual(len(data["results"]), 12)
+        self.assertEqual({r["tier"] for r in data["results"]}, {"all"})
+        self.assertEqual({r["matched_terms"] for r in data["results"]}, {3})
+        self.assertEqual({r["score"] for r in data["results"]}, {100})  # bm25 退化 → 100
         self.assertEqual(
             [r["topic_id"] for r in data["results"][:5]],
-            ["t012", "t011", "t010", "t009", "t008"],  # 平分时 updated_at 倒序
+            ["t012", "t011", "t010", "t009", "t008"],  # 退化层按 updated_at 倒序
         )
+        self.assertEqual(
+            data["recall"],
+            {"all_terms": 12, "partial": 0, "any_term": 12,
+             "total": 12, "returned": 12},
+        )
+        self.assertIn("12/12", data["hint"])  # 宽命中分支
         for offset, entry in enumerate(data["results"]):
             if offset < 5:
                 self.assertTrue(entry["full"])
@@ -1098,17 +1106,62 @@ class TestMatchCommand(TopicDockTestCase):
             ["match", "--topic", "JWT", "--store-dir", str(store), "--json"]
         )
         self.assertEqual(code, 0)
-        # alpha title 含 JWT（短语子串 3.0 → 75）；beta 继承的 C1 语句也含 jwt（token 2.0 → 50）
-        self.assertEqual(
-            [(r["topic_id"], r["score"]) for r in data["results"]],
-            [("alpha", 75), ("beta", 50)],
-        )
+        by_id = {r["topic_id"]: r for r in data["results"]}
+        self.assertEqual(set(by_id), {"alpha", "beta"})
+        for entry in by_id.values():
+            self.assertEqual(entry["tier"], "all")
+            self.assertEqual(entry["matched_terms"], 1)
         self.assertTrue(data["results"][0]["full"])
         self.assertIn("text", data["results"][0])
         code, data = run_cli_json(
             ["match", "--topic", "zzznomatch", "--store-dir", str(store), "--json"]
         )
-        self.assertEqual(data, {"status": "OK", "results": []})  # 无结果非错误
+        self.assertEqual(code, 0)
+        self.assertEqual(data["results"], [])
+        self.assertEqual(data["recall"]["any_term"], 0)
+        self.assertIn("0/3", data["hint"])  # 零命中分支
+
+    def test_match_tier_partial_and_any_cumulative(self):
+        store = make_store()
+        builder = ChainBuilder(store, "alpha", "alpha 主题")
+        builder.add_hop("H001", [], [
+            topicdock.HopBlock(item_id="C1", op="create",
+                               fields={"结论正文": "alpha jwt 改造 eddsa"}),
+        ])
+        builder.write_md()
+        builder = ChainBuilder(store, "beta", "beta 主题")
+        builder.add_hop("H002", [], [
+            topicdock.HopBlock(item_id="C1", op="create",
+                               fields={"结论正文": "beta jwt eddsa"}),
+        ])
+        builder.write_md()
+        builder = ChainBuilder(store, "gamma", "gamma 主题")
+        builder.add_hop("H003", [], [
+            topicdock.HopBlock(item_id="C1", op="create",
+                               fields={"结论正文": "gamma 改造"}),
+        ])
+        builder.write_md()
+
+        def ids(tier):
+            code, data = run_cli_json(
+                ["match", "--topic", "jwt", "--topic", "改造", "--topic", "eddsa",
+                 "--tier", tier, "--store-dir", str(store), "--json"]
+            )
+            self.assertEqual(code, 0)
+            return [(r["topic_id"], r["tier"]) for r in data["results"]], data
+
+        all_only, all_data = ids("all")
+        self.assertEqual(all_only, [("alpha", "all")])
+        # recall 与 --tier 无关：始终统计全部层
+        self.assertEqual(all_data["recall"]["any_term"], 3)
+        self.assertEqual(all_data["recall"]["partial"], 1)
+        partial, _ = ids("partial")
+        self.assertEqual(partial, [("alpha", "all"), ("beta", "partial")])
+        any_tier, _ = ids("any")
+        self.assertEqual(
+            any_tier,
+            [("alpha", "all"), ("beta", "partial"), ("gamma", "any")],
+        )
 
     def test_match_recent_takes_latest_five(self):
         store = make_store()
@@ -1120,8 +1173,12 @@ class TestMatchCommand(TopicDockTestCase):
         self.assertEqual(
             [r["topic_id"] for r in data["results"]], ["gamma", "beta", "alpha"]
         )
+        self.assertNotIn("recall", data)
+        self.assertNotIn("hint", data)
         for entry in data["results"]:
             self.assertIsNone(entry["score"])
+            self.assertNotIn("tier", entry)
+            self.assertNotIn("matched_terms", entry)
             self.assertTrue(entry["full"])
             self.assertIn("text", entry)
 
@@ -1135,6 +1192,16 @@ class TestMatchCommand(TopicDockTestCase):
         self.assertEqual(
             [r["topic_id"] for r in data["results"]], ["gamma", "beta", "alpha"]
         )
+
+    def test_match_recent_with_tier_is_invalid(self):
+        store = make_store()
+        build_rich_store(store)
+        code, data = run_cli_json(
+            ["match", "--recent", "--tier", "all",
+             "--store-dir", str(store), "--json"]
+        )
+        self.assertEqual(code, 7)
+        self.assertEqual(data["status"], "INVALID_INPUT")
 
     def test_match_tie_orders_topic_id_ascending(self):
         store = make_store()
@@ -1160,6 +1227,33 @@ class TestMatchCommand(TopicDockTestCase):
         code, data = run_cli_json(["match", "--store-dir", str(store), "--json"])
         self.assertEqual(code, 7)
         self.assertEqual(data["status"], "INVALID_INPUT")
+
+    def test_match_threshold_argument_is_rejected(self):
+        store = make_store()
+        build_rich_store(store)
+        with self.assertRaises(SystemExit) as caught:
+            run_cli(
+                ["match", "--topic", "JWT", "--threshold", "35",
+                 "--store-dir", str(store)]
+            )
+        self.assertEqual(caught.exception.code, 2)  # argparse 用法错误：失败关闭
+
+    def test_match_fts5_unavailable_reports_error(self):
+        store = make_store()
+        build_rich_store(store)
+        with mock.patch.object(topicdock, "_FTS5_AVAILABLE", False):
+            code, data = run_cli_json(
+                ["match", "--topic", "JWT", "--store-dir", str(store), "--json"]
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(data["status"], "ERROR")
+            self.assertIn("FTS5", data["error"])
+            # --recent 完全绕过 FTS5
+            code, data = run_cli_json(
+                ["match", "--recent", "--store-dir", str(store), "--json"]
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(len(data["results"]), 3)
 
 
 class TestViewCommand(TopicDockTestCase):
@@ -1307,7 +1401,7 @@ class TestUndoStackSemantics(TopicDockTestCase):
         self.assertEqual(after["hop_edges"], base_state["hop_edges"])
         self.assertEqual(after["item_hops"], base_state["item_hops"])
         self.assertEqual(after["item_links"], base_state["item_links"])
-        self.assertEqual(after["inverted_index"], base_state["inverted_index"])
+        self.assertEqual(after["topic_fts"], base_state["topic_fts"])
         md = (Path(store) / "topics" / "alpha.md").read_text(encoding="utf-8")
         self.assertIn("- [alpha:C1] 结论一", md)
         self.assertNotIn("结论二", md)  # C2 条目撤销
@@ -1406,11 +1500,11 @@ class TestUndoStackSemantics(TopicDockTestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("checks", report)
-        # 健康库：除 meta_json 与 doctor 双巡检（须 ok）外零修复
+        # 健康库：除 meta_json 与 doctor 巡检（须 ok）外零修复
         for check in report["checks"]:
             if check["name"] == "meta_json":
                 self.assertEqual(check["status"], "ok")
-            elif check["name"] in ("published_ledger", "hop_oid_drift"):
+            elif check["name"] in ("published_ledger", "hop_oid_drift", "match_index"):
                 self.assertEqual(check["status"], "ok")
             else:
                 self.fail(f"健康库不应有修复项: {check}")
@@ -2286,16 +2380,19 @@ LONG_CJK_RUN = "长" * 1600    # 单条 md 行 >1500 字符（CJK）
 GOLDEN_JSON_SHA256 = {
     "init": "d1c4da2419297e3b626224bf038fd35440f4b21656cd6d939efbbe1d9a46d1f6",
     "save_create": "22b3bb5a45c0495bf2fb66d9ff9d49a64ffc05ba64d4976b0bef5b825a5ceed8",
-    "save_create_second": "f9b8fcd24b71fa7f6fd0f78758a2ab791d185a6c56d4a262cbfc95834b583ec3",
+    # M2 有意再生成：similar_topics 改覆盖率口径（50 → 80）
+    "save_create_second": "c6441f07b30805e57feb25a63f8149310c337d3787fded78bd6dd9d30ba33844",
     "view": "174828cbf9fbaaa7f1bfb6972dc03d899c4f5a855666a62cd3de7855695eacb3",
     "view_history": "5ad0035905da9b96617c1715e0ca7266cd7702b053b687cca8a80dd471f8feeb",
     "list": "7338926f69789b994a2586cb7486d10823a204549d83f0ce574291b998dbb4d9",
     "use": "8c961a89e0762dee28904dd1356a03aa4a146e0e842843247415909e28fe4495",
-    "match": "37ca278eac0f67de0bf901b6953ead23ff97e23aa24fd22ac054ac28aa40afdc",
+    # M2 有意再生成：tier/matched_terms/score/recall/hint 新字段集
+    "match": "9716e001b01e0a18aab922047cb07a94cf8ed2b8e29b3b2f159d33d8274a4e6c",
     "trace": "575a88977ed5a9777544386d551c458dfefffdeb46bbc77890c5adcb20c12d6f",
     "delete": "2ad2f1e5f0ea50868241f800f7493930856b98992dcb0de281c2d019f2f122cc",
     "merge": "9fffb215b29b7d5848d17eef6482935633c63b3bda2496eddbfd4f47d251b850",
-    "doctor": "717fb627de3dc9718c015a224a1af8e9f60acf4511592a92f8d83b24a976c8a3",
+    # M1 有意再生成（M2 复核不变）：doctor 的 checks 含 match_index 巡检项
+    "doctor": "45241dccbeaea672f741da86085d9aebf61e7e46f94c92710bcec2f7457ed5c7",
     "undo": "2c24a7cfe91dc337862cca1710e762f030740c05b782fbb1fffdd78d253ed28b",
 }
 
@@ -2373,14 +2470,33 @@ class TestHumanReadableRendering(TopicDockTestCase):
         for index, (entry, block) in enumerate(zip(results, blocks), 1):
             self.assertTrue(block.startswith(f"{index}: {entry['topic_id']} ────"), block[:40])
             self.assertIn(f"──── end match {index} ────", block)
-            for key in ("topic_id", "title", "score", "full", "updated_at"):
+            for key in ("topic_id", "title", "tier", "matched_terms", "score",
+                        "full", "updated_at"):
                 self.assertIn(f"{key}:", block)
+            # tier/matched_terms 渲染在头部元数据区（base_sha / text 之前）
+            self.assertLess(block.index("tier:"), block.index("score:"))
+            self.assertLess(block.index("matched_terms:"), block.index("score:"))
             if entry["full"]:
                 self.assertRegex(block, r"base_sha: [0-9a-f]{64}")
+                self.assertLess(block.index("matched_terms:"), block.index("base_sha:"))
+                self.assertLess(block.index("tier:"), block.index("text:"))
                 self.assertIn("text:", block)
             else:
                 self.assertNotIn("base_sha:", block)
                 self.assertNotIn("\ntext:", block)
+
+    def test_match_recent_human_omits_tier_and_matched_terms(self):
+        store = self._store_with_long_line()
+        code, out = run_cli(["match", "--recent", "--store-dir", str(store)])
+        self.assertEqual(code, 0)
+        self._assert_line_budget(out)
+        blocks = out.split("──── match ")[1:]
+        self.assertTrue(blocks)
+        for block in blocks:
+            self.assertNotIn("tier:", block)
+            self.assertNotIn("matched_terms:", block)
+            self.assertNotIn("recall:", block)
+            self.assertNotIn("hint:", block)
 
     def test_match_long_cjk_text_is_folded_losslessly(self):
         store = self._store_with_long_line()

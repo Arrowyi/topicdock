@@ -542,7 +542,7 @@ def _upsert_topic_row(
             md_sha,
         ),
     )
-    refresh_inverted_index(conn, doc.topic_id, doc)
+    refresh_match_index(conn, doc.topic_id, doc, md_sha)
 
 
 def _merged_src_heads(
@@ -621,6 +621,7 @@ def rebuild_db_from_markdown(store: StoreContext) -> list[dict]:
     conn.executescript(_SCHEMA_SQL)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '1')")
+    match_index_available = ensure_match_index(conn)
 
     valid: list[dict] = []
     skipped: list[str] = []
@@ -695,6 +696,8 @@ def rebuild_db_from_markdown(store: StoreContext) -> list[dict]:
         (str(number),),
     )
     skipped = list(dict.fromkeys(skipped))
+    if match_index_available:
+        _write_match_index_meta(conn, _MATCH_INDEX_SCHEMA, {})
     conn.commit()
     conn.close()
     os.replace(tmp_path, store.db_path)
@@ -724,7 +727,218 @@ def rebuild_db_from_markdown(store: StoreContext) -> list[dict]:
         f"清理损坏主题 {len({t for t in skipped})} 个"
     )
     reports.append({"name": "rebuild_db", "status": "repaired", "detail": detail})
+    if match_index_available:
+        reports.append(
+            {
+                "name": "match_index",
+                "status": "rebuilt",
+                "detail": f"{_MATCH_INDEX_SCHEMA}，重建 {len(valid)} 个主题索引",
+            }
+        )
+    else:
+        reports.append(
+            {
+                "name": "match_index",
+                "status": "unavailable",
+                "detail": "SQLite 未启用 FTS5；匹配索引不可用",
+            }
+        )
     return reports
+
+
+# ---------- 匹配索引一次性迁移（design §5.2） ----------
+
+def _read_match_index_skipped(conn: sqlite3.Connection) -> dict[str, str]:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key=?", (_MATCH_INDEX_SKIPPED_KEY,)
+    ).fetchone()
+    if row is None:
+        return {}
+    try:
+        data = json.loads(row["value"])
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): str(value) for key, value in data.items()}
+
+
+def _write_match_index_meta(
+    conn: sqlite3.Connection, schema: str, skipped: dict[str, str]
+) -> None:
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (_MATCH_INDEX_SCHEMA_KEY, schema),
+    )
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (
+            _MATCH_INDEX_SKIPPED_KEY,
+            json.dumps(skipped, ensure_ascii=False, sort_keys=True),
+        ),
+    )
+
+
+def _load_topic_doc_for_index(store: StoreContext, topic_id: str) -> TopicDoc | None:
+    """迁移读顶层 md（`parse_topic_md`，O(1) 单文件；不强制 `_replay_chain`）。"""
+    md_path = store.topics_dir / f"{topic_id}.md"
+    try:
+        doc = parse_topic_md(md_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnsupportedSchemaVersion):
+        return None
+    return doc if doc.topic_id == topic_id else None
+
+
+def _migrate_match_index_once(
+    store: StoreContext, conn: sqlite3.Connection
+) -> dict | None:
+    global _FTS_NEEDS_FULL_REINDEX
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key=?", (_MATCH_INDEX_SCHEMA_KEY,)
+    ).fetchone()
+    current_schema = row["value"] if row is not None else None
+    full = _FTS_NEEDS_FULL_REINDEX or current_schema != _MATCH_INDEX_SCHEMA
+    topics = {
+        row["topic_id"]: row["md_sha256"]
+        for row in conn.execute("SELECT topic_id, md_sha256 FROM topics")
+    }
+    indexed = {
+        row["topic_id"]: row["md_sha256"]
+        for row in conn.execute("SELECT topic_id, md_sha256 FROM topic_fts")
+    }
+    if full:
+        conn.execute("DROP TABLE IF EXISTS inverted_index")
+        conn.execute("DELETE FROM topic_fts")
+    stale = [topic_id for topic_id in indexed if topic_id not in topics]
+    if stale:
+        delete_match_index(conn, stale)
+    # 重复行（手工写入/旧缺陷）按集合比较无法发现：强制重索引收敛为单行
+    duplicated = {
+        row["topic_id"]
+        for row in conn.execute(
+            "SELECT topic_id FROM topic_fts GROUP BY topic_id HAVING COUNT(*) > 1"
+        )
+    }
+    skipped_previous = _read_match_index_skipped(conn)
+    skipped: dict[str, str] = {}
+    reindexed = 0
+    for topic_id, md_sha in topics.items():
+        # 已登记 skip 且 md 不变：不重试解析；若残留 FTS 行/重复行则清掉，登记保留。
+        # 必须先于「索引一致」短路，否则同 sha 的残留行会先命中 continue。
+        if not full and skipped_previous.get(topic_id) == md_sha:
+            if topic_id in indexed or topic_id in duplicated:
+                delete_match_index(conn, [topic_id])
+            skipped[topic_id] = md_sha
+            continue
+        if not full and topic_id not in duplicated and indexed.get(topic_id) == md_sha:
+            continue
+        doc = _load_topic_doc_for_index(store, topic_id)
+        if doc is None:
+            if topic_id in indexed or topic_id in duplicated:
+                delete_match_index(conn, [topic_id])
+            skipped[topic_id] = md_sha
+            continue
+        refresh_match_index(conn, topic_id, doc, md_sha)
+        reindexed += 1
+    if full or current_schema != _MATCH_INDEX_SCHEMA or skipped != skipped_previous:
+        _write_match_index_meta(conn, _MATCH_INDEX_SCHEMA, skipped)
+    _FTS_NEEDS_FULL_REINDEX = False
+    if skipped:
+        return {
+            "name": "match_index",
+            "status": "mismatch",
+            "detail": f"跳过 {len(skipped)} 个无法解析的主题: {', '.join(sorted(skipped))}",
+        }
+    if reindexed or stale or full:
+        return {
+            "name": "match_index",
+            "status": "rebuilt",
+            "detail": f"重建 {reindexed} 个主题索引",
+        }
+    return None
+
+
+def _recover_match_index(
+    store: StoreContext, conn: sqlite3.Connection, cause: BaseException
+) -> dict:
+    """FTS 损坏自愈：drop + 重建空表 + 全量重索引；最终失败降级为 unavailable。"""
+    global _FTS5_AVAILABLE, _FTS_NEEDS_FULL_REINDEX
+    try:
+        conn.execute("SAVEPOINT match_index_recover")
+    except sqlite3.DatabaseError:
+        _FTS5_AVAILABLE = False
+        return {
+            "name": "match_index",
+            "status": "unavailable",
+            "detail": f"匹配索引损坏且无法重建（{cause}）；请运行 td doctor --rebuild",
+        }
+    try:
+        _drop_match_index_table(conn)
+        conn.execute(_TOPIC_FTS_SQL)
+        conn.execute("SELECT COUNT(*), MIN(md_sha256) FROM topic_fts").fetchone()
+        _FTS_NEEDS_FULL_REINDEX = True
+        _migrate_match_index_once(store, conn)
+    except (MatchIndexError, sqlite3.DatabaseError):
+        try:
+            conn.execute("ROLLBACK TO SAVEPOINT match_index_recover")
+            conn.execute("RELEASE SAVEPOINT match_index_recover")
+        except sqlite3.DatabaseError:
+            pass
+        _FTS5_AVAILABLE = False
+        return {
+            "name": "match_index",
+            "status": "unavailable",
+            "detail": f"匹配索引损坏且无法重建（{cause}）；请运行 td doctor --rebuild",
+        }
+    conn.execute("RELEASE SAVEPOINT match_index_recover")
+    skipped = _read_match_index_skipped(conn)
+    if skipped:
+        return {
+            "name": "match_index",
+            "status": "mismatch",
+            "detail": (
+                "检测到索引损坏，已清理重建；"
+                f"跳过 {len(skipped)} 个无法解析的主题: {', '.join(sorted(skipped))}"
+            ),
+        }
+    return {
+        "name": "match_index",
+        "status": "rebuilt",
+        "detail": "检测到索引损坏，已清理并全量重建",
+    }
+
+
+def migrate_match_index(
+    store: StoreContext, conn: sqlite3.Connection
+) -> dict | None:
+    """一次性索引迁移（design §5.2）：`(topic_id, md_sha256)` 集合比较 + 损坏自愈。
+
+    索引正常（零写入）时返回 None；实际重建/降级/跳过时返回 doctor 报告项。
+    迁移在调用方事务内以 SAVEPOINT 保证原子，失败不污染七步自愈成果。
+    """
+    if _FTS5_AVAILABLE is False:
+        return {
+            "name": "match_index",
+            "status": "unavailable",
+            "detail": "SQLite 未启用 FTS5；匹配索引不可用",
+        }
+    try:
+        conn.execute("SAVEPOINT match_index_migrate")
+    except sqlite3.DatabaseError as exc:
+        return _recover_match_index(store, conn, exc)
+    try:
+        report = _migrate_match_index_once(store, conn)
+    except (MatchIndexError, sqlite3.DatabaseError) as exc:
+        try:
+            conn.execute("ROLLBACK TO SAVEPOINT match_index_migrate")
+            conn.execute("RELEASE SAVEPOINT match_index_migrate")
+        except sqlite3.DatabaseError:
+            pass
+        return _recover_match_index(store, conn, exc)
+    conn.execute("RELEASE SAVEPOINT match_index_migrate")
+    return report
 
 
 # ---------- ⑥ meta.json 水位线修复 ----------
@@ -818,7 +1032,7 @@ def _adopt_crashed_topics(store: StoreContext, conn: sqlite3.Connection) -> tupl
             if src_row is None or src_row["head_hop"] != src_head:
                 continue  # src has advanced or this is not its current head: not a ②③ confluence window, never mistakenly deleted
             conn.execute("DELETE FROM topics WHERE topic_id=?", (src_origin,))
-            conn.execute("DELETE FROM inverted_index WHERE topic_id=?", (src_origin,))
+            delete_match_index(conn, [src_origin])
             src_md = store.topics_dir / f"{src_origin}.md"
             if src_md.is_file():
                 deferred.append(src_md)
@@ -901,6 +1115,7 @@ def _repair_topic_mds(
                 topic_id,
             ),
         )
+        refresh_match_index(conn, topic_id, rep.doc, sha256_text(text))
         reports.append(
             {"name": "md_repair", "status": "repaired", "detail": f"{topic_id}（重放还原）"}
         )
@@ -990,6 +1205,7 @@ def legacy_entity_cleanup(store: StoreContext, conn: sqlite3.Connection) -> list
             "UPDATE topics SET md_sha256=? WHERE topic_id=?",
             (sha256_text(text), topic_id),
         )
+        refresh_match_index(conn, topic_id, rep.doc, sha256_text(text))
         conn.commit()
         reports.append(
             {
@@ -1080,7 +1296,7 @@ def _roll_forward_amend(
             topic_id,
         ),
     )
-    refresh_inverted_index(conn, topic_id, rep.doc)
+    refresh_match_index(conn, topic_id, rep.doc, sha256_text(text))
     return store.root / _AMEND_PENDING_NAME
 
 
@@ -1290,6 +1506,7 @@ def ensure_store_healthy(store: StoreContext) -> tuple[sqlite3.Connection, list[
     损坏」在同一轮内闭环：重采纳的主题会立刻被 ⑤ 的 DB 闭包判定再次级联，
     不会复活损坏数据。
     """
+    global _FTS5_AVAILABLE
     reports: list[dict] = []
     need_rebuild = not store.db_path.is_file()
     probe: sqlite3.Connection | None = None
@@ -1297,22 +1514,19 @@ def ensure_store_healthy(store: StoreContext) -> tuple[sqlite3.Connection, list[
         probe = sqlite3.connect(str(store.db_path))
         probe.row_factory = sqlite3.Row
         try:
-            row = probe.execute(
-                "SELECT value FROM meta WHERE key='schema_version'"
-            ).fetchone()
-            if row is not None:
-                try:
-                    db_version = int(row["value"])
-                except ValueError:
-                    db_version = 1
-                if db_version > SUPPORTED_SCHEMA_VERSION:
-                    raise UnsupportedSchemaVersion(f"db schema_version={db_version}")
+            assert_db_schema_supported(probe)
             probe.execute("SELECT COUNT(*) FROM meta")
+            # 版本守卫之后、七步自愈之前：建表 + 廉价健康检查（损坏则重建空表）
+            ensure_match_index(probe)
             check = probe.execute("PRAGMA quick_check").fetchone()
             if check is None or str(check[0]).lower() != "ok":
                 need_rebuild = True
-        except sqlite3.DatabaseError:
-            need_rebuild = True
+        except sqlite3.DatabaseError as exc:
+            if str(exc) == _FTS5_MISSING_MODULE_MESSAGE:
+                # 精确等于缺模块才视为索引不可用：沿用现有 DB，迁移报 unavailable
+                _FTS5_AVAILABLE = False
+            else:
+                need_rebuild = True  # 其余按损坏处置
         except BaseException:
             probe.close()
             raise
@@ -1358,6 +1572,10 @@ def ensure_store_healthy(store: StoreContext) -> tuple[sqlite3.Connection, list[
             cascade_reports, cascade_files = _execute_heal_cascade(conn, store, cascades)
             reports.extend(cascade_reports)
             deferred_files.extend(cascade_files)
+        # 七步之后、命令提交之前：一次性索引迁移（正常时零追加、零写入）
+        match_report = migrate_match_index(store, conn)
+        if match_report is not None:
+            reports.append(match_report)
         conn.commit()
     except BaseException:
         conn.rollback()

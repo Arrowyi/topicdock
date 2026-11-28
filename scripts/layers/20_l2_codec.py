@@ -161,7 +161,11 @@ def _minimal_separator_escape(body: str, boundary: int | None) -> str:
     )
 
 
-def _unescape_item_text(text: str) -> str:
+def unescape_item_text(text: str) -> str:
+    """条目文本解码正典：`&#8212;`→`—`、`&#40;`→`(`（幂等）。
+
+    L3 `refresh_match_index` 以此为 FTS 喂词正典形（增量/重建/迁移三路统一）。
+    """
     return text.replace("&#8212;", "—").replace("&#40;", "(")
 
 
@@ -184,9 +188,9 @@ def _split_item_body(body: str) -> tuple[str, str | None, str | None, str | None
         if best_sep.startswith(" — 依据("):
             status = "verified" if "verified" in best_sep else "inferred"
     return (
-        _unescape_item_text(statement),
+        unescape_item_text(statement),
         status,
-        _unescape_item_text(basis) if basis is not None else None,
+        unescape_item_text(basis) if basis is not None else None,
         tag,
     )
 
